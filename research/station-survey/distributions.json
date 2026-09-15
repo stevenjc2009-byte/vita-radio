@@ -1,0 +1,206 @@
+{
+  "all_nonbroken": {
+    "label": "all non-broken (n=58573)",
+    "n": 58573,
+    "codec": {
+      "MP3": {
+        "count": 39571,
+        "pct": 67.56
+      },
+      "AAC+": {
+        "count": 8489,
+        "pct": 14.49
+      },
+      "AAC": {
+        "count": 8024,
+        "pct": 13.7
+      },
+      "UNKNOWN": {
+        "count": 1772,
+        "pct": 3.03
+      },
+      "OGG": {
+        "count": 598,
+        "pct": 1.02
+      },
+      "AAC,H.264": {
+        "count": 79,
+        "pct": 0.13
+      },
+      "MP4": {
+        "count": 18,
+        "pct": 0.03
+      },
+      "FLV": {
+        "count": 16,
+        "pct": 0.03
+      },
+      "FLAC": {
+        "count": 4,
+        "pct": 0.01
+      },
+      "AAC+,H.264": {
+        "count": 1,
+        "pct": 0.0
+      },
+      "UNKNOWN,H.264": {
+        "count": 1,
+        "pct": 0.0
+      }
+    },
+    "hls": {
+      "0": {
+        "count": 54778,
+        "pct": 93.52
+      },
+      "1": {
+        "count": 3795,
+        "pct": 6.48
+      }
+    },
+    "scheme": {
+      "https": {
+        "count": 36557,
+        "pct": 62.41
+      },
+      "http": {
+        "count": 22016,
+        "pct": 37.59
+      }
+    },
+    "bitrate_bucket": {
+      "128-191": {
+        "count": 22342,
+        "pct": 38.14
+      },
+      "0/unknown": {
+        "count": 11922,
+        "pct": 20.35
+      },
+      "192-255": {
+        "count": 5698,
+        "pct": 9.73
+      },
+      "64-95": {
+        "count": 5608,
+        "pct": 9.57
+      },
+      ">=256": {
+        "count": 5169,
+        "pct": 8.82
+      },
+      "<64": {
+        "count": 4483,
+        "pct": 7.65
+      },
+      "96-127": {
+        "count": 3351,
+        "pct": 5.72
+      }
+    },
+    "ssl_error": {
+      "0": {
+        "count": 57941,
+        "pct": 98.92
+      },
+      "1": {
+        "count": 632,
+        "pct": 1.08
+      }
+    }
+  },
+  "top1000": {
+    "label": "top 1000 by clickcount",
+    "n": 1000,
+    "codec": {
+      "MP3": {
+        "count": 687,
+        "pct": 68.7
+      },
+      "AAC": {
+        "count": 133,
+        "pct": 13.3
+      },
+      "AAC+": {
+        "count": 119,
+        "pct": 11.9
+      },
+      "UNKNOWN": {
+        "count": 53,
+        "pct": 5.3
+      },
+      "OGG": {
+        "count": 6,
+        "pct": 0.6
+      },
+      "FLV": {
+        "count": 1,
+        "pct": 0.1
+      },
+      "AAC,H.264": {
+        "count": 1,
+        "pct": 0.1
+      }
+    },
+    "hls": {
+      "0": {
+        "count": 899,
+        "pct": 89.9
+      },
+      "1": {
+        "count": 101,
+        "pct": 10.1
+      }
+    },
+    "scheme": {
+      "https": {
+        "count": 628,
+        "pct": 62.8
+      },
+      "http": {
+        "count": 372,
+        "pct": 37.2
+      }
+    },
+    "bitrate_bucket": {
+      "128-191": {
+        "count": 386,
+        "pct": 38.6
+      },
+      "0/unknown": {
+        "count": 233,
+        "pct": 23.3
+      },
+      "192-255": {
+        "count": 96,
+        "pct": 9.6
+      },
+      "64-95": {
+        "count": 79,
+        "pct": 7.9
+      },
+      ">=256": {
+        "count": 72,
+        "pct": 7.2
+      },
+      "96-127": {
+        "count": 71,
+        "pct": 7.1
+      },
+      "<64": {
+        "count": 63,
+        "pct": 6.3
+      }
+    },
+    "ssl_error": {
+      "0": {
+        "count": 995,
+        "pct": 99.5
+      },
+      "1": {
+        "count": 5,
+        "pct": 0.5
+      }
+    }
+  }
+}

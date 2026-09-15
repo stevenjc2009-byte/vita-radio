@@ -1,0 +1,84 @@
+{
+  "n_probed": 300,
+  "category_counts": {
+    "http_403": 37,
+    "ok": 255,
+    "tls_error": 3,
+    "other_error": 1,
+    "timeout": 3,
+    "http_401": 1
+  },
+  "final_status_counts": {
+    "403": 37,
+    "200": 255,
+    "401": 1
+  },
+  "content_type_counts_ok_only": {
+    "audio/mpeg": 173,
+    "application/x-mpegurl": 7,
+    "audio/aac": 20,
+    "application/vnd.apple.mpegurl": 25,
+    "audio/aacp": 29,
+    "audio/mp3": 1
+  },
+  "playlist_kind_counts": {
+    "m3u8": 32
+  },
+  "icy_metaint_present_counts_ok_only": {
+    "True": 219,
+    "False": 36
+  },
+  "tls_version_counts": {
+    "TLSv1.3": 154,
+    "TLSv1.2": 22
+  },
+  "redirect_count_distribution": {
+    "0": 195,
+    "1": 86,
+    "2": 18,
+    "3": 1
+  },
+  "https_count": 185,
+  "tls12_capped_ok_counts": {
+    "True": 158,
+    "False": 21
+  },
+  "tls13_only_suspected_count": 2,
+  "tls13_only_suspected_examples": [
+    {
+      "name": "Al Arabiya FM",
+      "url": "https://fm.alarabiya.net/fm/myStream/playlist.m3u8",
+      "tls_version": "TLSv1.3",
+      "tls12_error": "SSLError: [SSL: TLSV1_ALERT_PROTOCOL_VERSION] tlsv1 alert protocol version (_ssl.c:1032)"
+    },
+    {
+      "name": "Christmas Vinyl HD",
+      "url": "https://icecast.walmradio.com:8443/christmas",
+      "tls_version": "TLSv1.2",
+      "tls12_error": "TimeoutError: The read operation timed out"
+    }
+  ],
+  "non_ok_non_http_error_categories": {
+    "tls_error": 3,
+    "other_error": 1,
+    "timeout": 3
+  },
+  "http_error_status_categories": {
+    "http_403": 37,
+    "http_401": 1
+  },
+  "adts_direct_stream_count": 46,
+  "adts_profile_counts": {
+    "LC": 46
+  },
+  "hls_segment_type_counts": {
+    "nested-m3u8 (first entry was a variant playlist, not a media segment)": 17,
+    "MPEG-TS": 13,
+    "unknown (first bytes: 33013f8cc9e57af8)": 1,
+    "gzip-compressed body (likely playlist/text, not raw media)": 1
+  },
+  "m3u8_ext_x_key_counts": {
+    "False": 31,
+    "True": 1
+  }
+}

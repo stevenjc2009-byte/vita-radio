@@ -1,0 +1,13 @@
+build/
+build-*/
+*.o
+*.d
+*.elf
+*.velf
+*.vpk
+eboot.bin
+param.sfo
+
+# station survey dumps (73 MB; regenerate with research/station-survey)
+research/station-survey/all_stations.json
+research/**/*.raw.json
