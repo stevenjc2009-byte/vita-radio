@@ -81,9 +81,11 @@ int main(void)
 
     CHECK("bk_hls_apple", sniff_body_kind("application/vnd.apple.mpegurl") == VR_BODY_HLS);
     CHECK("bk_hls_x", sniff_body_kind("Application/X-MpegURL; charset=utf-8") == VR_BODY_HLS);
-    CHECK("bk_hls_audio_mpegurl", sniff_body_kind("audio/mpegurl") == VR_BODY_HLS);
     CHECK("bk_pls", sniff_body_kind("audio/x-scpls") == VR_BODY_PLS);
     CHECK("bk_m3u", sniff_body_kind("audio/x-mpegurl") == VR_BODY_M3U);
+    /* audio/mpegurl and audio/x-mpegurl are the same classic plain-M3U type;
+     * only the two application types mean HLS. */
+    CHECK("bk_m3u_audio_mpegurl", sniff_body_kind("audio/mpegurl") == VR_BODY_M3U);
     CHECK("bk_text_html", sniff_body_kind("text/html; charset=UTF-8") == VR_BODY_TEXT);
     CHECK("bk_text_plain", sniff_body_kind("TEXT/plain") == VR_BODY_TEXT);
     CHECK("bk_audio_mpeg", sniff_body_kind("audio/mpeg") == VR_BODY_AUDIO);
@@ -165,6 +167,28 @@ int main(void)
     buf[1] = buf[201] = 0xF3;   /* layer 01: not ADTS */
     CHECK("adts_bad_layer_unknown", sniff_codec_from_bytes(buf, n) == VR_CODEC_UNKNOWN);
 
+    /* The syncword and the layer bits are only 14 of the bits that have to be
+     * right. adts_scan.c also rejects the reserved/escape sampling frequency
+     * indexes and an absent channel configuration; sniff must agree, or a
+     * body of noise with two plausible pairs in it passes as AAC. */
+    {
+        int good, bad_freq, bad_chan;
+        n = 0;
+        n += put_adts(buf + n, 200);
+        n += put_adts(buf + n, 200);
+        good = sniff_codec_from_bytes(buf, n) == VR_CODEC_AAC;
+        buf[2] = buf[202] = 0x7C;        /* freq index 15 = escape */
+        bad_freq = sniff_codec_from_bytes(buf, n) == VR_CODEC_UNKNOWN;
+        n = 0;
+        n += put_adts(buf + n, 200);
+        n += put_adts(buf + n, 200);
+        buf[3] = buf[203] = 0x00;        /* channel_configuration 0 */
+        bad_chan = sniff_codec_from_bytes(buf, n) == VR_CODEC_UNKNOWN;
+        CHECK("adts_green_control_aac", good);
+        CHECK("adts_bad_freq_unknown", bad_freq);
+        CHECK("adts_bad_chan_unknown", bad_chan);
+    }
+
     /* ---- ID3v2 ---------------------------------------------------- */
     n = put_id3(buf, 1000, 0);
     n += put_mp3_v1(buf + n, 0);
@@ -208,8 +232,30 @@ int main(void)
         CHECK("body_m3u_url_later_line", sniff_body_kind_from_bytes((const unsigned char *)url2, strlen(url2)) == VR_BODY_M3U);
         CHECK("body_pls_case", sniff_body_kind_from_bytes((const unsigned char *)pls, strlen(pls)) == VR_BODY_PLS);
         CHECK("body_html_text", sniff_body_kind_from_bytes((const unsigned char *)html, strlen(html)) == VR_BODY_TEXT);
-        CHECK("body_other_audio", sniff_body_kind_from_bytes((const unsigned char *)junk, strlen(junk)) == VR_BODY_AUDIO);
+        /* An all-text body with no playlist line in it is a message - almost
+         * always an error page - not audio. Calling it audio costs 50 decode
+         * errors before the player gives up. */
+        CHECK("body_other_text", sniff_body_kind_from_bytes((const unsigned char *)junk, strlen(junk)) == VR_BODY_TEXT);
         CHECK("body_empty_audio", sniff_body_kind_from_bytes((const unsigned char *)"", 0) == VR_BODY_AUDIO);
+    }
+    {
+        const char *err   = "Error 404";
+        const char *plain = "Station temporarily unavailable\r\nTry again later\n";
+        const char *utf8  = "Fehler: Sender nicht verf\xC3\xBCgbar";
+        CHECK("body_plain_error_text", sniff_body_kind_from_bytes((const unsigned char *)err, strlen(err)) == VR_BODY_TEXT);
+        CHECK("body_plain_lines_text", sniff_body_kind_from_bytes((const unsigned char *)plain, strlen(plain)) == VR_BODY_TEXT);
+        CHECK("body_utf8_error_text", sniff_body_kind_from_bytes((const unsigned char *)utf8, strlen(utf8)) == VR_BODY_TEXT);
+
+        /* RED controls: real audio must still be audio. A 0xFF sync byte is
+         * not a legal UTF-8 lead byte, which is what keeps them apart. */
+        n = 0;
+        n += put_adts(buf + n, 200);
+        n += put_adts(buf + n, 200);
+        CHECK("body_adts_bytes_audio", sniff_body_kind_from_bytes(buf, n) == VR_BODY_AUDIO);
+        n = 0;
+        n += put_mp3_v1(buf + n, 0);
+        n += put_mp3_v1(buf + n, 0);
+        CHECK("body_mp3_bytes_audio", sniff_body_kind_from_bytes(buf, n) == VR_BODY_AUDIO);
     }
 
     printf("test_sniff: %d passed, %d failed\n", g_pass, g_fail);

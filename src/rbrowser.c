@@ -112,18 +112,32 @@ static size_t utf8_trim(const char *s, size_t n)
 }
 
 /* Copies into a fixed field, truncating on a character boundary and always
- * terminating. A station with a very long name is worth showing truncated. */
-static void copy_field(char *dst, size_t dstsz, const char *src)
+ * terminating. Returns 0, or -1 if the value did not fit: a station with a very
+ * long name is worth showing truncated, but a truncated URL or uuid is a
+ * different address and a different station, so the caller has to be able to
+ * tell the two cases apart.
+ *
+ * Tabs and newlines become spaces here rather than at save time. favourites.tsv
+ * makes the same substitution on the way out (favourites.c fput_field), so
+ * doing it on the way in is what stops the in-memory name and the persisted one
+ * from disagreeing after a reload. */
+static int copy_field(char *dst, size_t dstsz, const char *src)
 {
-    size_t n;
+    size_t n, i;
+    int fits;
 
     if (!src)
         src = "";
     n = strlen(src);
-    if (n >= dstsz)
+    fits = (n < dstsz);
+    if (!fits)
         n = utf8_trim(src, dstsz - 1);
     memcpy(dst, src, n);
     dst[n] = '\0';
+    for (i = 0; i < n; i++)
+        if (dst[i] == '\t' || dst[i] == '\n' || dst[i] == '\r')
+            dst[i] = ' ';
+    return fits ? 0 : -1;
 }
 
 /* ---- JSON field access ---------------------------------------------------- */
@@ -149,9 +163,16 @@ static int field_int(const JsonValue *obj, const char *key)
     if (!v)
         return 0;
     switch (json_type(v)) {
-    case JSON_NUMBER:
-        n = (long)json_number(v, 0.0);
+    case JSON_NUMBER: {
+        /* Range-check before the cast, not after: JSON has no bound on an
+         * exponent, so "1e999" arrives as an infinity and casting that to long
+         * is undefined - LONG_MIN here, a saturated INT32_MAX on ARM VFP. */
+        double d = json_number(v, 0.0);
+        if (!(d > 0.0 && d <= 1000000.0))
+            return 0;
+        n = (long)d;
         break;
+    }
     case JSON_BOOL:
         n = json_bool(v, 0);
         break;
@@ -226,7 +247,13 @@ static int clamp_limit(int limit)
 /* Fills out from a parsed response. Rows with no URL at all are skipped - the
  * UI can do nothing with a station it cannot play - but a row missing anything
  * else is kept, because codec, bitrate and country are user-submitted and are
- * wrong or absent often enough that dropping on them would empty the list. */
+ * wrong or absent often enough that dropping on them would empty the list.
+ *
+ * A URL or a uuid that does not fit its field is skipped for the same reason as
+ * a missing one: truncated, it is a different address and a different station,
+ * so keeping the row would dial the wrong stream and register the click against
+ * somebody else. Name, codec and country are only ever displayed, so a short
+ * version of those is still useful and is kept. */
 static int build_result(const JsonValue *root, int limit, RbResult *out,
                         char *err, size_t errsz)
 {
@@ -264,14 +291,17 @@ static int build_result(const JsonValue *root, int limit, RbResult *out,
         if (!*url)
             continue;
 
-        st = &items[kept++];
+        st = &items[kept];
+        if (copy_field(st->url, sizeof(st->url), url) != 0)
+            continue;
+        if (copy_field(st->uuid, sizeof(st->uuid), field_str(o, "stationuuid")) != 0)
+            continue;
         copy_field(st->name, sizeof(st->name), field_str(o, "name"));
-        copy_field(st->url, sizeof(st->url), url);
         copy_field(st->codec, sizeof(st->codec), field_str(o, "codec"));
         copy_field(st->country, sizeof(st->country), field_str(o, "countrycode"));
-        copy_field(st->uuid, sizeof(st->uuid), field_str(o, "stationuuid"));
         st->bitrate = field_int(o, "bitrate");
         st->is_hls = field_int(o, "hls") != 0;
+        kept++;
     }
     if (kept == 0) {
         free(items);

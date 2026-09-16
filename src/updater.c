@@ -13,10 +13,13 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
 #include <unistd.h>
 
 #include <psp2/appmgr.h>
+#include <psp2/io/devctl.h>
 #include <psp2/kernel/processmgr.h>
+#include <psp2/kernel/rng.h>
 #include <psp2/kernel/threadmgr.h>
 
 #define RELEASE_API     "https://api.github.com/repos/stevenjc2009-byte/vita-radio/releases/latest"
@@ -24,7 +27,13 @@
 #define VPK_PATH        DATA_DIR "/update.vpk"
 #define STAGE_DIR       DATA_DIR "/stage"
 #define RESULT_PATH     DATA_DIR "/update_result.txt"
-#define PKG_DIR         "ux0:data/pkg"      /* the path VitaShell promotes from */
+/* Our own staging directory, not ux0:data/pkg: that one belongs to the user,
+ * who keeps VPKs there for VitaShell, and we delete the whole tree twice per
+ * install. ScePromoterUtil promotes any directory it is handed. */
+#define PKG_DIR         DATA_DIR "/pkg"
+#define TOKEN_PATH      DATA_DIR "/update_token.bin"
+#define PENDING_PATH    DATA_DIR "/update_pending.txt"
+#define LAUNCH_FAIL     "launch "     /* marks a RESULT_PATH line we wrote ourselves */
 #define HEADBIN_TMPL    "app0:assets/head.bin"
 #define HELPER_EBOOT    "app0:updater/eboot.bin"
 #define HELPER_SFO      "app0:updater/param.sfo"
@@ -58,6 +67,15 @@ static void set_status(UpdateState state, const char *fmt, ...)
     va_start(ap, fmt);
     vsnprintf(s_status.message, sizeof(s_status.message), fmt, ap);
     va_end(ap);
+    pthread_mutex_unlock(&s_lock);
+}
+
+/* Same lock as every other s_status write, so the UI can never read a stale
+ * percentage from a previous attempt under a fresh download. */
+static void clear_progress(void)
+{
+    pthread_mutex_lock(&s_lock);
+    s_status.progress_pct = 0;
     pthread_mutex_unlock(&s_lock);
 }
 
@@ -131,6 +149,47 @@ static int write_head_bin(const char *dir, const char *want_title_id)
     return write_all(path, out, (size_t)tmpl_len) == 0 ? 0 : -3;
 }
 
+/* A package whose eboot.bin is missing or empty installs fine and then won't
+ * launch - and since the updater lives inside the app being replaced, there is
+ * no way back without a PC. Both files must be there before we promote. */
+static int stage_looks_complete(const char *dir)
+{
+    struct stat sb;
+    char path[FS_PATH_LEN];
+
+    snprintf(path, sizeof(path), "%s/eboot.bin", dir);
+    if (stat(path, &sb) != 0 || sb.st_size <= 0)
+        return 0;
+    snprintf(path, sizeof(path), "%s/sce_sys/param.sfo", dir);
+    return stat(path, &sb) == 0 && sb.st_size > 0;
+}
+
+/* Writes the one-shot token that authorises the updater title to promote this
+ * package, and only this one. Must land before the package moves to PKG_DIR. */
+static int write_update_token(const char *dir, const char *tag)
+{
+    uint8_t sfo[16 * 1024], nonce[16];
+    char path[FS_PATH_LEN];
+    UpdateToken t;
+
+    snprintf(path, sizeof(path), "%s/sce_sys/param.sfo", dir);
+    long n = read_all(path, sfo, sizeof(sfo));
+    if (n <= 0 || sceKernelGetRandomNumber(nonce, sizeof(nonce)) < 0)
+        return -1;
+    update_token_build(&t, tag, nonce, sfo, (size_t)n);
+    return write_all(TOKEN_PATH, (const uint8_t *)&t, sizeof(t));
+}
+
+/* Free bytes on ux0, or -1 when the device won't say. */
+static int64_t ux0_free_bytes(void)
+{
+    SceIoDevInfo info;
+    memset(&info, 0, sizeof(info));
+    if (sceIoDevctl("ux0:", 0x3001, NULL, 0, &info, sizeof(info)) < 0)
+        return -1;
+    return (int64_t)info.free_size;
+}
+
 /* ---- network -------------------------------------------------------------- */
 
 typedef struct {
@@ -155,15 +214,27 @@ static int progress_cb(void *user, curl_off_t dltotal, curl_off_t dlnow,
 {
     (void)ultotal; (void)ulnow;
     sceKernelPowerTick(SCE_KERNEL_POWER_TICK_DEFAULT);   /* don't sleep mid-download */
+    /* dltotal is 0 when the server sent no Content-Length; leaving the guard in
+     * place leaves progress_pct at the 0 clear_progress() set, and the UI draws
+     * an indeterminate bar rather than a percentage of an unknown total. */
     if (user && dltotal > 0) {
-        int pct = (int)(dlnow * 100 / dltotal);
+        /* int64_t rather than curl_off_t: curl_off_t is whatever the backend's
+         * headers say, and the two TLS backends compile against different ones
+         * (see the Makefile). A 32-bit intermediate wraps partway through a
+         * 64 MB VPK, so pin a width that cannot. */
+        int64_t p = (int64_t)dlnow * 100 / (int64_t)dltotal;
+        /* A server may send more bytes than it promised - don't report 147%. */
+        int pct = p < 0 ? 0 : (p > 100 ? 100 : (int)p);
         pthread_mutex_lock(&s_lock);
         char tag[sizeof(s_status.latest)];
         snprintf(tag, sizeof(tag), "%s", s_status.latest);
         snprintf(s_status.message, sizeof(s_status.message), "Downloading %s: %d%%", tag, pct);
+        s_status.progress_pct = (unsigned)pct;
         pthread_mutex_unlock(&s_lock);
     }
-    if (dltotal > VPK_MAX)
+    /* dltotal is only the server's claim, and is 0 for a chunked response;
+     * dlnow is what actually reached the card, so cap that too. */
+    if (dltotal > VPK_MAX || dlnow > VPK_MAX)
         return 1;
     return atomic_load(&s_abort) ? 1 : 0;
 }
@@ -178,6 +249,15 @@ static CURL *new_request(const char *url, char *errbuf)
     curl_easy_setopt(c, CURLOPT_USERAGENT, s_user_agent);
     curl_easy_setopt(c, CURLOPT_FOLLOWLOCATION, 1L);
     curl_easy_setopt(c, CURLOPT_MAXREDIRS, 8L);
+    /* We follow redirects, so the whole chain has to stay on https or the
+     * CAINFO/VERIFYPEER work below can be stepped around by one 302. */
+#if LIBCURL_VERSION_NUM >= 0x075500   /* 7.85.0 added the string forms */
+    curl_easy_setopt(c, CURLOPT_PROTOCOLS_STR, "https");
+    curl_easy_setopt(c, CURLOPT_REDIR_PROTOCOLS_STR, "https");
+#else
+    curl_easy_setopt(c, CURLOPT_PROTOCOLS, (long)CURLPROTO_HTTPS);
+    curl_easy_setopt(c, CURLOPT_REDIR_PROTOCOLS, (long)CURLPROTO_HTTPS);
+#endif
     curl_easy_setopt(c, CURLOPT_CONNECTTIMEOUT, 20L);
     curl_easy_setopt(c, CURLOPT_LOW_SPEED_LIMIT, 1L);
     curl_easy_setopt(c, CURLOPT_LOW_SPEED_TIME, 30L);
@@ -230,18 +310,22 @@ static void *check_thread(void *arg)
         set_status(UPD_ERROR, "No release published yet");
     else if (code != 200)
         set_status(UPD_ERROR, "Update check failed: HTTP %ld", code);
-    else if (release_json_parse(body.data, tag, sizeof(tag), url, sizeof(url)) != 0 ||
-             !version_valid(tag))
-        set_status(UPD_ERROR, "Update check failed: no VPK in the latest release");
     else {
-        pthread_mutex_lock(&s_lock);
-        snprintf(s_status.latest, sizeof(s_status.latest), "%s", tag);
-        snprintf(s_vpk_url, sizeof(s_vpk_url), "%s", url);
-        pthread_mutex_unlock(&s_lock);
-        if (version_compare(tag, VR_VERSION) > 0)
-            set_status(UPD_AVAILABLE, "Update %s available - press TRIANGLE to install", tag);
-        else
-            set_status(UPD_UP_TO_DATE, "Up to date (v%s)", VR_VERSION);
+        int pr = release_json_parse(body.data, tag, sizeof(tag), url, sizeof(url));
+        if (pr == RELEASE_JSON_ERR_TAG_LONG)
+            set_status(UPD_ERROR, "Update check failed: the release tag is too long");
+        else if (pr != RELEASE_JSON_OK || !version_valid(tag))
+            set_status(UPD_ERROR, "Update check failed: no usable VPK in the latest release");
+        else {
+            pthread_mutex_lock(&s_lock);
+            snprintf(s_status.latest, sizeof(s_status.latest), "%s", tag);
+            snprintf(s_vpk_url, sizeof(s_vpk_url), "%s", url);
+            pthread_mutex_unlock(&s_lock);
+            if (version_compare(tag, VR_VERSION) > 0)
+                set_status(UPD_AVAILABLE, "Update %s available - press TRIANGLE to install", tag);
+            else
+                set_status(UPD_UP_TO_DATE, "Up to date (v%s)", VR_VERSION);
+        }
     }
 
 done:
@@ -262,6 +346,16 @@ static int download_vpk(const char *url)
 {
     char errbuf[CURL_ERROR_SIZE];
     fs_mkdir_p(DATA_DIR);
+
+    /* Refuse up front rather than filling the card and failing mid-write.
+     * VPK_MAX is exactly what this function is allowed to write. */
+    int64_t freeb = ux0_free_bytes();
+    if (freeb >= 0 && freeb < VPK_MAX) {
+        set_status(UPD_ERROR, "Not enough space on ux0: %ld MB free, %ld MB needed",
+                   (long)(freeb / (1024 * 1024)), (long)(VPK_MAX / (1024 * 1024)));
+        return -1;
+    }
+
     FILE *f = fopen(VPK_PATH, "wb");
     if (!f) {
         set_status(UPD_ERROR, "Couldn't write " VPK_PATH);
@@ -282,6 +376,7 @@ static int download_vpk(const char *url)
     curl_easy_getinfo(c, CURLINFO_RESPONSE_CODE, &code);
     curl_easy_cleanup(c);
     int close_bad = fclose(f) != 0;
+    clear_progress();   /* the download is over, however it ended */
 
     if (atomic_load(&s_abort)) {
         set_status(UPD_IDLE, " ");
@@ -309,7 +404,7 @@ static int unpack_tick(void *user)
     return atomic_load(&s_abort);
 }
 
-/* Stages the helper title in ux0:data/pkg and installs it. */
+/* Stages the helper title in PKG_DIR and installs it. */
 static int install_helper(void)
 {
     fs_rm_tree(PKG_DIR);
@@ -340,13 +435,22 @@ static void *install_thread(void *arg)
     int res = zip_extract(VPK_PATH, STAGE_DIR, unpack_tick, NULL);
     unlink(VPK_PATH);
     if (res != ZIP_OK) {
+        fs_rm_tree(STAGE_DIR);      /* a partial tree is junk, and may be why the card filled */
         if (res == ZIP_ERR_ABORTED)
             set_status(UPD_IDLE, " ");
+        else if (res == ZIP_ERR_TOO_BIG)
+            set_status(UPD_ERROR, "Update package is too large to install");
         else
             set_status(UPD_ERROR, "Update package is damaged: %s", zip_strerror(res));
         goto done;
     }
+    if (!stage_looks_complete(STAGE_DIR)) {
+        fs_rm_tree(STAGE_DIR);
+        set_status(UPD_ERROR, "Downloaded package is incomplete");
+        goto done;
+    }
     if (write_head_bin(STAGE_DIR, MAIN_TITLE_ID) != 0) {
+        fs_rm_tree(STAGE_DIR);
         set_status(UPD_ERROR, "Downloaded package isn't a valid Vita Radio VPK");
         goto done;
     }
@@ -360,10 +464,22 @@ static void *install_thread(void *arg)
     }
 
     fs_rm_tree(PKG_DIR);
+    /* The token has to describe the package while it is still in STAGE_DIR and
+     * be on the card before the package is, so the helper can never find a
+     * package with no token beside it. */
+    if (write_update_token(STAGE_DIR, tag) != 0) {
+        fs_rm_tree(STAGE_DIR);
+        set_status(UPD_ERROR, "Couldn't authorise the update on " DATA_DIR);
+        goto done;
+    }
     if (rename(STAGE_DIR, PKG_DIR) != 0) {
+        unlink(TOKEN_PATH);
+        fs_rm_tree(STAGE_DIR);
         set_status(UPD_ERROR, "Couldn't move the update into " PKG_DIR);
         goto done;
     }
+    /* Remembered so the next boot can tell "installed" from "silently didn't". */
+    write_all(PENDING_PATH, (const uint8_t *)tag, strlen(tag));
     unlink(RESULT_PATH);
     set_status(UPD_READY, "Restarting to install %s...", tag);
 
@@ -405,17 +521,39 @@ void updater_init(const char *user_agent, const char *ca_file)
     memset(&s_status, 0, sizeof(s_status));
     s_status.state = UPD_IDLE;
 
-    /* the helper title leaves its result here */
+    /* the helper title leaves its result here (and so do we, if it never ran) */
     uint8_t line[32];
     long n = read_all(RESULT_PATH, line, sizeof(line) - 1);
     if (n > 0) {
         line[n] = '\0';
-        unsigned long code = strtoul((const char *)line, NULL, 0);
-        if (code == 0)
-            set_status(UPD_UP_TO_DATE, "Update installed - now v%s", VR_VERSION);
-        else
+        const char *p = (const char *)line;
+        int launch_fail = strncmp(p, LAUNCH_FAIL, sizeof(LAUNCH_FAIL) - 1) == 0;
+        if (launch_fail)
+            p += sizeof(LAUNCH_FAIL) - 1;
+        unsigned long code = strtoul(p, NULL, 0);
+
+        /* The tag we staged, so a "success" that didn't change VR_VERSION is
+         * caught instead of being offered again on every check from now on. */
+        uint8_t want[sizeof(s_status.latest)];
+        long w = read_all(PENDING_PATH, want, sizeof(want) - 1);
+        if (w > 0) {
+            want[w] = '\0';
+            while (w > 0 && (want[w - 1] == '\n' || want[w - 1] == '\r'))
+                want[--w] = '\0';
+        }
+
+        if (launch_fail)
+            set_status(UPD_ERROR, "Couldn't start the updater (0x%08lX). " UNSAFE_HINT, code);
+        else if (code != 0)
             set_status(UPD_ERROR, "Update install failed (0x%08lX). " UNSAFE_HINT, code);
+        else if (w > 0 && version_compare((const char *)want, VR_VERSION) > 0)
+            set_status(UPD_ERROR, "Update did not take effect - reinstall manually");
+        else
+            set_status(UPD_UP_TO_DATE, "Update installed - now v%s", VR_VERSION);
+
         unlink(RESULT_PATH);
+        unlink(PENDING_PATH);
+        unlink(TOKEN_PATH);
         fs_rm_tree(PKG_DIR);
     }
 }
@@ -442,6 +580,7 @@ void updater_install(void)
     pthread_mutex_unlock(&s_lock);
     if (!ok)
         return;
+    clear_progress();   /* before the worker starts, so no stale bar is drawn */
     set_status(UPD_DOWNLOADING, "Starting download...");
     start_worker(install_thread);
 }
@@ -458,7 +597,16 @@ void updater_launch(void)
     const char *uri = "psgm:play?titleid=" HELPER_TITLE_ID;
     sceAppMgrLaunchAppByUri(0xFFFFF, uri);
     sceKernelDelayThread(10 * 1000);
-    sceAppMgrLaunchAppByUri(0xFFFFF, uri);
+    int res = sceAppMgrLaunchAppByUri(0xFFFFF, uri);
+    if (res < 0) {
+        /* The UI is already down and the helper will never run, so nothing else
+         * can report this. Leave the reason where the next boot reads it - if
+         * the helper does start after all, it overwrites this with its own. */
+        char line[32];
+        int len = snprintf(line, sizeof(line), LAUNCH_FAIL "0x%08X\n", (unsigned int)res);
+        write_all(RESULT_PATH, (const uint8_t *)line, (size_t)len);
+        return;   /* main() falls through to its own sceKernelExitProcess */
+    }
     sceKernelExitProcess(0);
 }
 

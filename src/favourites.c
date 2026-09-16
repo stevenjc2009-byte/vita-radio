@@ -10,9 +10,13 @@
 
 #if defined(_WIN32)
 #include <direct.h>
+#include <io.h>
 #define VR_MKDIR(p) _mkdir(p)
+#define VR_FSYNC(fd) _commit(fd)
 #else
+#include <unistd.h>
 #define VR_MKDIR(p) mkdir((p), 0777)
+#define VR_FSYNC(fd) fsync(fd)
 #endif
 
 /* Deliberately no psp2/ headers here: the host unit tests link this file, and
@@ -71,6 +75,11 @@ int fav_save(const StationList *l, const char *path)
         fputc('\n', f);
     }
     bad = ferror(f);
+    /* Push the bytes to the card before the rename. FAT can commit the
+     * directory entry ahead of the data, so a power cut between the two would
+     * otherwise leave a zero-length favourites file where a complete one was. */
+    if (!bad && (fflush(f) != 0 || VR_FSYNC(fileno(f)) != 0))
+        bad = 1;
     if (fclose(f) != 0)
         bad = 1;
     if (bad) {
@@ -80,15 +89,38 @@ int fav_save(const StationList *l, const char *path)
     }
 
     /* Rename over the target so an interrupted save cannot destroy the file
-     * that is already there. POSIX replaces atomically; where rename refuses
-     * an existing target, fall back to remove-then-rename. */
+     * that is already there. POSIX replaces atomically; newlib's rename refuses
+     * an existing target - so does sceIoRename under it - which makes this
+     * fallback the normal path on the Vita, not a rare one. Removing the old
+     * file there would open a window on every single save in which there are no
+     * favourites at all, so it steps aside as ".bak" instead and is only
+     * deleted once the new file is in place. */
     if (rename(tmp, path) != 0) {
-        remove(path);
-        if (rename(tmp, path) != 0) {
-            remove(tmp);
+        char *bak = (char *)malloc(plen + 5);    /* ".bak" + NUL */
+        int moved;
+
+        if (!bak) {
             free(tmp);
             return -1;
         }
+        memcpy(bak, path, plen);
+        memcpy(bak + plen, ".bak", 5);
+
+        remove(bak);                             /* left by an earlier failure */
+        moved = (rename(path, bak) == 0);        /* fails if there was no file */
+        if (rename(tmp, path) != 0) {
+            if (moved)
+                rename(bak, path);               /* put the old one back */
+            /* tmp is a complete, good file. It is deliberately left where it
+             * is: deleting it here would throw away the only copy of the new
+             * favourites as well as whatever the failed rename cost us. */
+            free(bak);
+            free(tmp);
+            return -1;
+        }
+        if (moved)
+            remove(bak);
+        free(bak);
     }
     free(tmp);
     return 0;
@@ -137,6 +169,14 @@ static int lb_read_line(FILE *f, LineBuf *lb, int *terminated)
         return ferror(f) ? -1 : 0;
     if (lb->len > 0 && lb->buf[lb->len - 1] == '\r')
         lb->len--;                            /* tolerate CRLF files */
+    if (!lb->buf) {
+        /* An empty line pushed nothing, so on the very first line of the file
+         * there is no buffer yet to terminate. One push allocates the block;
+         * the byte it wrote is then discarded. */
+        if (lb_push(lb, '\0') != 0)
+            return -1;
+        lb->len = 0;
+    }
     lb->buf[lb->len] = '\0';
     return 1;
 }

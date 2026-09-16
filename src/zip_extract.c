@@ -13,8 +13,13 @@
 #define EOCD_LEN    22
 #define CENTRAL_LEN 46
 #define LOCAL_LEN   30
-#define NAME_LEN    255
+/* The spec allows 65535, but a name that can't fit under the target directory
+ * is useless to us anyway, so the path buffer sets the limit. */
+#define NAME_LEN    (FS_PATH_LEN - 1)
 #define CHUNK       (64 * 1024)
+/* Nothing we ship comes close, and without it a deflated entry may declare up
+ * to 4 GB of output, 65535 times over, with no free-space check behind it. */
+#define MAX_TOTAL_OUT (96ull * 1024 * 1024)
 
 static uint16_t rd16(const uint8_t *p)
 {
@@ -62,6 +67,7 @@ const char *zip_strerror(int err)
     case ZIP_ERR_ABORTED:     return "cancelled";
     case ZIP_ERR_NOMEM:       return "out of memory";
     case ZIP_ERR_EMPTY:       return "empty archive";
+    case ZIP_ERR_TOO_BIG:     return "package is too large";
     }
     return "unknown error";
 }
@@ -107,11 +113,17 @@ typedef struct {
     uint8_t *in, *out;
     ZipTick  tick;
     void    *user;
+    uint64_t written;      /* bytes produced so far, across every entry */
 } Ctx;
 
 static int copy_entry(Ctx *c, long data_off, uint32_t csize, uint32_t usize, int method,
                       uint32_t want_crc, FILE *dst)
 {
+    /* An entry that really is empty has no data to read, whatever the method
+     * says; a deflated one has no stream to hand to inflate. */
+    if (csize == 0 && usize == 0)
+        return crc32(0L, Z_NULL, 0) == want_crc ? ZIP_OK : ZIP_ERR_CRC;
+
     if (fseek(c->zip, data_off, SEEK_SET) != 0)
         return ZIP_ERR_READ;
 
@@ -131,6 +143,9 @@ static int copy_entry(Ctx *c, long data_off, uint32_t csize, uint32_t usize, int
             crc = crc32(crc, c->in, (uInt)n);
             left -= (uint32_t)n;
             produced += (uint32_t)n;
+            c->written += n;
+            if (c->written > MAX_TOTAL_OUT)
+                return ZIP_ERR_TOO_BIG;
             if (c->tick && c->tick(c->user))
                 return ZIP_ERR_ABORTED;
         }
@@ -173,6 +188,11 @@ static int copy_entry(Ctx *c, long data_off, uint32_t csize, uint32_t usize, int
             }
             crc = crc32(crc, c->out, (uInt)have);
             produced += (uint32_t)have;
+            c->written += have;
+            if (c->written > MAX_TOTAL_OUT) {
+                res = ZIP_ERR_TOO_BIG;
+                break;
+            }
             if (c->tick && c->tick(c->user)) {
                 res = ZIP_ERR_ABORTED;
                 break;
@@ -188,6 +208,27 @@ static int copy_entry(Ctx *c, long data_off, uint32_t csize, uint32_t usize, int
     return ZIP_OK;
 }
 
+/* First pass over the central directory: adds up what the archive says it will
+ * unpack to, so an over-large one is refused before a byte of it is written. */
+static int check_total_size(Ctx *c, long cd_off, unsigned count)
+{
+    uint64_t total = 0;
+    long pos = cd_off;
+
+    for (unsigned i = 0; i < count; i++) {
+        uint8_t h[CENTRAL_LEN];
+        if (read_at(c->zip, pos, h, sizeof(h)) != 0)
+            return ZIP_ERR_READ;
+        if (rd32(h) != SIG_CENTRAL)
+            return ZIP_ERR_FORMAT;
+        total += rd32(h + 24);
+        if (total > MAX_TOTAL_OUT)
+            return ZIP_ERR_TOO_BIG;
+        pos += CENTRAL_LEN + rd16(h + 28) + rd16(h + 30) + rd16(h + 32);
+    }
+    return ZIP_OK;
+}
+
 static int extract_all(Ctx *c, const char *dir)
 {
     long cd_off;
@@ -197,6 +238,9 @@ static int extract_all(Ctx *c, const char *dir)
         return res;
     if (count == 0)
         return ZIP_ERR_EMPTY;
+    res = check_total_size(c, cd_off, count);
+    if (res != ZIP_OK)
+        return res;
 
     long pos = cd_off;
     for (unsigned i = 0; i < count; i++) {
@@ -212,8 +256,10 @@ static int extract_all(Ctx *c, const char *dir)
         uint16_t nlen = rd16(h + 28), xlen = rd16(h + 30), clen = rd16(h + 32);
         uint32_t loff = rd32(h + 42);
 
-        if (nlen == 0 || nlen > NAME_LEN)
+        if (nlen == 0)
             return ZIP_ERR_FORMAT;
+        if (nlen > NAME_LEN)
+            return ZIP_ERR_UNSUPPORTED;   /* legal, but can't fit our paths */
         if (read_at(c->zip, pos + CENTRAL_LEN, (uint8_t *)name, nlen) != 0)
             return ZIP_ERR_READ;
         name[nlen] = '\0';

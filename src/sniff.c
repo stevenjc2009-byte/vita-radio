@@ -49,12 +49,14 @@ VrBodyKind sniff_body_kind(const char *content_type)
         return VR_BODY_AUDIO;
     media_type(content_type, t, sizeof(t));
     if (strcmp(t, "application/vnd.apple.mpegurl") == 0 ||
-        strcmp(t, "application/x-mpegurl") == 0 ||
-        strcmp(t, "audio/mpegurl") == 0)
+        strcmp(t, "application/x-mpegurl") == 0)
         return VR_BODY_HLS;
     if (strcmp(t, "audio/x-scpls") == 0)
         return VR_BODY_PLS;
-    if (strcmp(t, "audio/x-mpegurl") == 0)
+    /* audio/mpegurl and audio/x-mpegurl are both the classic plain-M3U type;
+     * only the application ones mean HLS. */
+    if (strcmp(t, "audio/x-mpegurl") == 0 ||
+        strcmp(t, "audio/mpegurl") == 0)
         return VR_BODY_M3U;
     if (strncmp(t, "text/", 5) == 0)
         return VR_BODY_TEXT;
@@ -93,11 +95,20 @@ static size_t mp3_frame_len(const unsigned char *p, size_t avail)
     return 72u * br / sr + pad;
 }
 
-/* Returns the ADTS frame length at p, or 0 if not a valid header. */
+/* Returns the ADTS frame length at p, or 0 if not a valid header. The field
+ * rejections match adts_scan.c: the syncword and the layer bits alone are
+ * only 14 bits, which noise clears often enough to matter. */
 static size_t adts_frame_len(const unsigned char *p, size_t avail)
 {
+    unsigned freq, chan;
     size_t fl;
     if (avail < 7 || p[0] != 0xFF || (p[1] & 0xF6) != 0xF0)
+        return 0;
+    freq = (unsigned)(p[2] >> 2) & 0x0F;
+    chan = (unsigned)((p[2] & 1) << 2) | (unsigned)(p[3] >> 6);
+    if (freq > 12)                  /* 13, 14 reserved; 15 is escape */
+        return 0;
+    if (chan == 0)                  /* 0 means an in-band PCE: not a radio feed */
         return 0;
     fl = ((size_t)(p[3] & 3) << 11) | ((size_t)p[4] << 3) | (size_t)(p[5] >> 5);
     return fl >= 7 ? fl : 0;
@@ -193,8 +204,29 @@ VrBodyKind sniff_body_kind_from_bytes(const unsigned char *buf, size_t len)
         unsigned char c = buf[i];
         if (c == 0 || (c < 0x20 && c != '\t' && c != '\r' && c != '\n'))
             break;
+        if (c >= 0x80) {
+            /* Only a well-formed UTF-8 sequence counts as text. This is what
+             * keeps audio out: 0xFF and 0xFE - the MPEG and ADTS sync byte
+             * among them - are not legal lead bytes at all. */
+            size_t extra = (c >= 0xF0) ? 3 : (c >= 0xE0) ? 2 : (c >= 0xC2) ? 1 : 0;
+            size_t k;
+            if (extra == 0 || i + extra >= len)
+                break;
+            for (k = 1; k <= extra; k++)
+                if ((buf[i + k] & 0xC0) != 0x80)
+                    break;
+            if (k <= extra)
+                break;
+            i += extra;
+            continue;
+        }
         if ((i == 0 || buf[i - 1] == '\n') && prefix_ci(buf + i, len - i, "http"))
             return VR_BODY_M3U;
     }
+    /* Every byte was text and no playlist line turned up: a message, almost
+     * always an error page. Calling it audio costs 50 decode errors and a
+     * multi-second hang before the player gives up on a dead station. */
+    if (i == len && len > 0)
+        return VR_BODY_TEXT;
     return VR_BODY_AUDIO;
 }

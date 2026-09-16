@@ -25,6 +25,7 @@ typedef struct {
     int       discontinuity;    /* 1 if preceded by #EXT-X-DISCONTINUITY */
     int       encrypted;        /* 1 if an AES-128 EXT-X-KEY applies */
     char     *key_uri;          /* absolute, NULL when not encrypted */
+    char      key_method[32];   /* EXT-X-KEY METHOD verbatim, "" if no key tag */
     unsigned char iv[16];       /* explicit IV, or seq zero-padded big-endian */
 } M3u8Segment;
 
@@ -42,8 +43,9 @@ typedef struct {
 /* base_url resolves relative URIs; pass the URL the text was fetched from.
  * Returns 0 on success, -1 if the text is not a playlist (no #EXTM3U).
  * An EXT-X-KEY with METHOD=NONE clears encryption for following segments;
- * a METHOD this parser does not understand (SAMPLE-AES) marks those segments
- * encrypted with key_uri NULL, so the caller can refuse them cleanly. */
+ * a METHOD this parser does not understand (SAMPLE-AES), or one whose URI or IV
+ * was too long to have arrived intact, marks those segments encrypted with
+ * key_uri NULL, so the caller can refuse them cleanly and name key_method. */
 int  m3u8_parse(const char *text, size_t len, const char *base_url, M3u8 *out);
 void m3u8_free(M3u8 *p);
 

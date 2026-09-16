@@ -224,8 +224,12 @@ static char *decode_string(const char *s, size_t len)
                 } else {
                     cp = 0xFFFD;    /* unpaired high surrogate */
                 }
-            } else if (cp >= 0xDC00 && cp <= 0xDFFF) {
-                cp = 0xFFFD;        /* stray low surrogate */
+            } else if (cp == 0 || (cp >= 0xDC00 && cp <= 0xDFFF)) {
+                /* Stray low surrogate, or a NUL. json_string() returns a bare
+                 * char* with no length, so a NUL here would end the value for
+                 * every consumer - a station URL would be stored and dialled
+                 * truncated. U+FFFD keeps the 6-in/3-out size invariant. */
+                cp = 0xFFFD;
             }
             o += utf8_put(out + o, cp);
             break;

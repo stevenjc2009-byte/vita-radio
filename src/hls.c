@@ -28,6 +28,8 @@
 #define KEY_CACHE_SLOTS    4
 #define MAX_SEG_FAILS      5
 #define MAX_RELOAD_FAILS   5
+#define MAX_STALE_RELOADS  2                   /* reloads that offered nothing new */
+#define STALL_TARGETS      6.0                 /* silence before the stream is dead */
 #define SLEEP_SLICE_US     100000              /* stop is noticed within 100 ms */
 #define TARGET_MIN         1.0                 /* never poll faster than this */
 #define TARGET_MAX         60.0
@@ -73,6 +75,7 @@ struct HlsStream {
     TsDemux    *ts;
     AdtsScan   *adts;
     int         last_was_ts;
+    int         pending_disc;      /* a discontinuity we stepped over, not yet applied */
     int         ready_sent;
     long        seg_status;
     KeyEntry    keys[KEY_CACHE_SLOTS];
@@ -453,18 +456,25 @@ static int play_segment(HlsStream *s, const M3u8Segment *seg, char *err, size_t 
     size_t len;
     int r;
 
-    if (seg->discontinuity) {
+    /* pending_disc carries a discontinuity that belonged to a segment we never
+     * played - one below next_seq, or a whole stretch the live window slid
+     * past. Applying it here is what stops an ad break or an encoder restart
+     * resuming into a demuxer still holding the old PID map. */
+    if (seg->discontinuity || s->pending_disc) {
         if (s->ts)
             ts_demux_reset(s->ts);
         if (s->adts)
             adts_scan_reset(s->adts);
+        s->pending_disc = 0;
         note(s, "Discontinuity at segment %lld", seg->seq);
     }
 
-    /* m3u8.c marks a METHOD it cannot do (SAMPLE-AES) as encrypted with no key
-     * URI. Refusing it beats writing noise into the decoder. */
+    /* m3u8.c marks a METHOD it cannot do (SAMPLE-AES), or a key URI or IV that
+     * did not arrive whole, as encrypted with no key URI. Refusing it beats
+     * writing noise into the decoder; naming the METHOD makes it diagnosable
+     * from the device instead of "unsupported". */
     if (seg->encrypted && !seg->key_uri) {
-        set_err(err, errsz, "unsupported encryption method");
+        set_err(err, errsz, "no usable key for METHOD '%s'", seg->key_method);
         return -1;
     }
 
@@ -497,13 +507,17 @@ static int play_segment(HlsStream *s, const M3u8Segment *seg, char *err, size_t 
 
 /* ---- worker -------------------------------------------------------------- */
 
-/* Plays every segment at or after *next_seq. Returns 0 to carry on, -1 when the
- * stream is over (err says why, empty for a clean stop). */
+/* Plays every segment at or after *next_seq. *considered is how many this
+ * playlist actually offered at or after it: zero means the playlist has stopped
+ * advancing, which the caller has to notice because nothing here will.
+ * Returns 0 to carry on, -1 when the stream is over (err says why, empty for a
+ * clean stop). */
 static int play_window(HlsStream *s, const M3u8 *pl, long long *next_seq,
-                       int *seg_fails, char *err, size_t errsz)
+                       int *seg_fails, int *considered, char *err, size_t errsz)
 {
     int i;
 
+    *considered = 0;
     for (i = 0; i < pl->segment_count; i++) {
         const M3u8Segment *seg = &pl->segments[i];
         int r;
@@ -512,8 +526,13 @@ static int play_window(HlsStream *s, const M3u8 *pl, long long *next_seq,
             err[0] = '\0';
             return -1;
         }
-        if (seg->seq < *next_seq)
+        if (seg->seq < *next_seq) {
+            /* Already played, or stepped over: its discontinuity still has to
+             * reach whichever segment we do play next. */
+            s->pending_disc |= seg->discontinuity;
             continue;
+        }
+        (*considered)++;
 
         r = play_segment(s, seg, err, errsz);
         *next_seq = seg->seq + 1;
@@ -528,8 +547,12 @@ static int play_window(HlsStream *s, const M3u8 *pl, long long *next_seq,
             atomic_fetch_add(&s->segments_failed, 1);
             note(s, "Skipped segment %lld: %s", seg->seq, err);
             if (++*seg_fails > MAX_SEG_FAILS) {
+                /* err is the destination buffer: passing it as its own %s
+                 * argument is undefined and eats the real cause. */
+                char reason[ERR_MAX];
+                snprintf(reason, sizeof(reason), "%s", err);
                 set_err(err, errsz, "%d segments in a row failed: %s",
-                        *seg_fails, err);
+                        *seg_fails, reason);
                 return -1;
             }
             continue;
@@ -547,7 +570,9 @@ static void *worker(void *arg)
     char media_url[URL_MAX];
     char err[ERR_MAX];
     long long next_seq = -1;
-    int have_start = 0, seg_fails = 0, reload_fails = 0;
+    int have_start = 0, seg_fails = 0, reload_fails = 0, stale_reloads = 0;
+    long long last_edge = -1;
+    long last_progress;
 
     err[0] = '\0';
     memset(&pl, 0, sizeof(pl));
@@ -577,10 +602,14 @@ static void *worker(void *arg)
         goto done;
     }
 
+    last_progress = now_ms();
+
     for (;;) {
         long long before = next_seq;
         double target;
-        long started, wait_ms, spent;
+        long started, wait_ms, spent, idle;
+        long long edge;
+        int considered = 0, done_before;
         M3u8 next;
 
         if (!have_start) {
@@ -589,14 +618,18 @@ static void *worker(void *arg)
         } else if (next_seq < pl.segments[0].seq) {
             /* The window slid past us while we were downloading. Skipping to
              * its start loses audio, but chasing segments that no longer exist
-             * loses the stream. */
+             * loses the stream. Everything in between is gone unseen, which is
+             * a discontinuity whether or not one was tagged. */
             note(s, "Fell behind the live window, skipping to segment %lld",
                  pl.segments[0].seq);
             next_seq = pl.segments[0].seq;
+            s->pending_disc = 1;
         }
 
         started = now_ms();
-        if (play_window(s, &pl, &next_seq, &seg_fails, err, sizeof(err)) != 0)
+        done_before = atomic_load(&s->segments_done);
+        if (play_window(s, &pl, &next_seq, &seg_fails, &considered,
+                        err, sizeof(err)) != 0)
             goto done;
         if (atomic_load(&s->stop)) {
             err[0] = '\0';
@@ -612,6 +645,41 @@ static void *worker(void *arg)
          * downloading counts towards the wait, so a slow segment does not push
          * us off the live edge. */
         target = clamp_target(pl.target_duration);
+
+        /* A playlist that stops advancing past next_seq plays nothing and
+         * raises nothing - the "fell behind" check above only fires the other
+         * way. A live feed with no EXT-X-MEDIA-SEQUENCE is renumbered from 0 on
+         * every reload, and a server that rewinds its sequence has the same
+         * effect: every segment reads as already played, forever. Resync to the
+         * live edge rather than sleeping on it.
+         *
+         * A healthy stream that is merely caught up also offers nothing, so the
+         * end of the window has to have stopped moving as well before this
+         * counts as stuck - otherwise a feed that publishes a little late would
+         * be dragged backwards and replay what it just played. */
+        edge = pl.segments[pl.segment_count - 1].seq;
+        if (considered > 0 || edge != last_edge) {
+            stale_reloads = 0;
+        } else if (++stale_reloads > MAX_STALE_RELOADS) {
+            next_seq = pl.segments[live_start_index(&pl)].seq;
+            s->pending_disc = 1;
+            stale_reloads = 0;
+            note(s, "Playlist stopped advancing, resyncing to segment %lld",
+                 next_seq);
+        }
+        last_edge = edge;
+
+        /* And if the resync does not take either, the stream is dead: say so
+         * instead of going quiet and leaving the user staring at a playing UI. */
+        if (atomic_load(&s->segments_done) != done_before)
+            last_progress = now_ms();
+        idle = now_ms() - last_progress;
+        if (idle > (long)(STALL_TARGETS * target * 1000.0)) {
+            set_err(err, sizeof(err), "stalled: no segment played for %ld s",
+                    idle / 1000);
+            goto done;
+        }
+
         wait_ms = (long)(target * (next_seq != before ? 1000.0 : 500.0));
         spent = now_ms() - started;
         if (spent < wait_ms)
@@ -629,8 +697,13 @@ static void *worker(void *arg)
         } else {
             m3u8_free(&next);
             if (++reload_fails > MAX_RELOAD_FAILS) {
+                /* Copied out first: err is the destination, and reading it as
+                 * its own %s argument is undefined and loses the real cause. */
+                char reason[ERR_MAX];
+                snprintf(reason, sizeof(reason), "%s",
+                         err[0] ? err : "not a media playlist");
                 set_err(err, sizeof(err), "playlist reload failed %d times: %s",
-                        reload_fails, err[0] ? err : "not a media playlist");
+                        reload_fails, reason);
                 goto done;
             }
             note(s, "Playlist reload failed (%d/%d), retrying",

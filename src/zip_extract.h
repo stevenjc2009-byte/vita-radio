@@ -16,7 +16,8 @@ enum {
     ZIP_ERR_CRC         = -8,
     ZIP_ERR_ABORTED     = -9,
     ZIP_ERR_NOMEM       = -10,
-    ZIP_ERR_EMPTY       = -11
+    ZIP_ERR_EMPTY       = -11,
+    ZIP_ERR_TOO_BIG     = -12   /* declared output exceeds the extraction cap */
 };
 
 /* Called after every chunk; return nonzero to abort. May be NULL. */

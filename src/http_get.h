@@ -16,8 +16,10 @@ typedef struct {
     char  *final_url;   /* after redirects - resolve relative URIs against this */
 } HttpDoc;
 
-/* max_bytes 0 means VR_HTTP_GET_MAX. Returns 0 on a 2xx response with a body,
- * else -1 with a readable reason in err. out is zeroed on failure. */
+/* max_bytes 0 means VR_HTTP_GET_MAX, and is clamped to it - a caller can ask
+ * for less than the cap, never for more. ca_file is required: NULL is a
+ * configuration error, not "use curl's default". Returns 0 on a 2xx response
+ * with a body, else -1 with a readable reason in err. out is zeroed on failure. */
 int  http_get(const char *url, const char *user_agent, const char *ca_file,
               size_t max_bytes, HttpDoc *out, char *err, size_t errsz);
 

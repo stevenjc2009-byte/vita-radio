@@ -24,8 +24,13 @@ int url_is_absolute(const char *s)
     return *p == ':';
 }
 
-/* Collapse "." and ".." in place. Keeps a leading and trailing slash. */
-static void normalize_path(char *path, size_t sz)
+/* Collapse "." and ".." in place. Keeps a leading and trailing slash.
+   Empty segments are kept: RFC 3986 5.2.4 removes only "." and "..", and a
+   "//" inside a path is a real segment the origin server will insist on.
+   Returns 0, or -1 if the path has more segments than MAX_SEGS or does not
+   fit -- dropping the excess would hand the caller a wrong URL that looks
+   like a successful resolution. */
+static int normalize_path(char *path, size_t sz)
 {
     const char *segs[MAX_SEGS];
     size_t      lens[MAX_SEGS];
@@ -48,12 +53,13 @@ static void normalize_path(char *path, size_t sz)
             if (n > 0)
                 n--;
             trailing = 1;
-        } else if (l > 0) {
-            if (n < MAX_SEGS) {
-                segs[n] = s;
-                lens[n] = l;
-                n++;
-            }
+        } else {
+            /* Keep zero-length segments: "//" is meaningful to the origin. */
+            if (n >= MAX_SEGS)
+                return -1;
+            segs[n] = s;
+            lens[n] = l;
+            n++;
             trailing = 0;
         }
         if (!e)
@@ -70,7 +76,7 @@ static void normalize_path(char *path, size_t sz)
         if (i && pos + 1 < sizeof(tmp))
             tmp[pos++] = '/';
         if (pos + lens[i] + 2 >= sizeof(tmp))
-            break;
+            return -1;
         memcpy(tmp + pos, segs[i], lens[i]);
         pos += lens[i];
     }
@@ -78,7 +84,8 @@ static void normalize_path(char *path, size_t sz)
         tmp[pos++] = '/';
     tmp[pos] = '\0';
 
-    snprintf(path, sz, "%s", tmp);
+    int w = snprintf(path, sz, "%s", tmp);
+    return (w < 0 || (size_t)w >= sz) ? -1 : 0;
 }
 
 int url_resolve(const char *base, const char *ref, char *out, size_t outsz)
@@ -113,6 +120,25 @@ int url_resolve(const char *base, const char *ref, char *out, size_t outsz)
 
     char path[MAX_PATH_LEN];
 
+    /* RFC 3986 5.4.1: a reference that is nothing but a query or a fragment
+       keeps the base's whole path, last segment included. Token-refresh
+       playlist references ("?token=...") take this form, and merging them
+       against the base's directory silently drops the playlist filename. */
+    if (ref_path_len == 0 && tail) {
+        const char *bend = auth_end;
+        while (*bend && *bend != '?' && *bend != '#')
+            bend++;
+        if (ref[0] == '#') {
+            /* A fragment keeps the base's query too; a query replaces it. */
+            while (*bend && *bend != '#')
+                bend++;
+        }
+        int w = snprintf(out, outsz, "%.*s%s%s",
+                         (int)(bend - base), base,
+                         (bend == auth_end) ? "/" : "", tail);
+        return (w < 0 || (size_t)w >= outsz) ? -1 : 0;
+    }
+
     if (ref[0] == '/' && ref[1] == '/') {
         /* scheme-relative: everything after "//" is a fresh authority+path. */
         char rest[MAX_PATH_LEN];
@@ -122,8 +148,8 @@ int url_resolve(const char *base, const char *ref, char *out, size_t outsz)
         rest[ref_path_len] = '\0';
 
         char *slash = strchr(rest + 2, '/');
-        if (slash)
-            normalize_path(slash, sizeof(rest) - (size_t)(slash - rest));
+        if (slash && normalize_path(slash, sizeof(rest) - (size_t)(slash - rest)) != 0)
+            return -1;
 
         int w = snprintf(out, outsz, "%.*s:%s%s",
                          (int)scheme_len, base, rest, tail ? tail : "");
@@ -163,7 +189,8 @@ int url_resolve(const char *base, const char *ref, char *out, size_t outsz)
         path[pos] = '\0';
     }
 
-    normalize_path(path, sizeof(path));
+    if (normalize_path(path, sizeof(path)) != 0)
+        return -1;
 
     int w = snprintf(out, outsz, "%.*s%s%s",
                      (int)prefix_len, base, path, tail ? tail : "");

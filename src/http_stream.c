@@ -2,6 +2,7 @@
 #include "icy.h"
 
 #include <curl/curl.h>
+#include <errno.h>
 #include <pthread.h>
 #include <stdatomic.h>
 #include <stdio.h>
@@ -9,6 +10,10 @@
 #include <string.h>
 
 #define WORKER_STACK_SIZE (256 * 1024)
+
+/* Sane band for icy-metaint. Real stations use 8192-65536; anything outside
+ * this is a broken header, not a block size we should trust. */
+#define ICY_METAINT_MAX   (1024 * 1024)
 
 struct HttpStream {
     char       *url;
@@ -27,8 +32,11 @@ struct HttpStream {
 
     /* worker-owned until finished */
     long       metaint;
+    int        metaint_bad;        /* header was present but unusable */
+    char       metaint_raw[32];    /* the rejected value, for the notice */
     char       content_type[128];
     int        got_body;
+    size_t     audio_bytes;        /* audio handed to the ring buffer so far */
     long       http_status;
     int        result;
     char       errmsg[CURL_ERROR_SIZE + 16];
@@ -75,12 +83,17 @@ static size_t header_cb(char *data, size_t size, size_t nmemb, void *userp)
     while (n > 0 && (line[n - 1] == '\r' || line[n - 1] == '\n'))
         line[--n] = '\0';
 
-    /* Every new status line (redirect hop) starts a fresh header set.
+    /* Every new status line (redirect hop) starts a fresh header set, so the
+     * body latch has to re-arm with it - libcurl hands us the body of each
+     * redirect hop too, and only the last hop is the real response.
      * SHOUTcast v1 answers with "ICY 200 OK" instead of "HTTP/1.x". */
     if ((n >= 5 && memcmp(line, "HTTP/", 5) == 0) ||
         (n >= 4 && memcmp(line, "ICY ", 4) == 0)) {
         s->metaint = 0;
+        s->metaint_bad = 0;
+        s->metaint_raw[0] = '\0';
         s->content_type[0] = '\0';
+        s->got_body = 0;
         return total;
     }
 
@@ -95,18 +108,41 @@ static size_t header_cb(char *data, size_t size, size_t nmemb, void *userp)
         *--end = '\0';
 
     if ((size_t)(colon - line) == 11 && ci_equal_n(line, "icy-metaint", 11)) {
-        long v = strtol(val, NULL, 10);
-        s->metaint = v > 0 ? v : 0;
+        char *ep = val;
+        long v;
+        errno = 0;
+        v = strtol(val, &ep, 10);
+        /* A garbled or absurd value must not quietly become "no metadata":
+         * that feeds every metadata block to the decoder as audio. Keep 0 so
+         * the parser stays off, but record it so the notice can say why. */
+        if (ep == val || *ep != '\0' || errno == ERANGE ||
+            v <= 0 || v > ICY_METAINT_MAX) {
+            s->metaint = 0;
+            s->metaint_bad = 1;
+            snprintf(s->metaint_raw, sizeof(s->metaint_raw), "%s", val);
+        } else {
+            s->metaint = v;
+        }
     } else if ((size_t)(colon - line) == 12 && ci_equal_n(line, "content-type", 12)) {
         snprintf(s->content_type, sizeof(s->content_type), "%s", val);
     }
     return total;
 }
 
+/* Only a 2xx carries a stream, and 204/205 are defined to carry no body at all.
+ * Everything else is an error page, an un-followable redirect, or nothing. */
+static int status_is_streamable(long code)
+{
+    return code >= 200 && code <= 299 && code != 204 && code != 205;
+}
+
 static int icy_audio_cb(void *user, const unsigned char *data, size_t len)
 {
     HttpStream *s = user;
-    return rb_write(s->out, data, len) < 0 ? -1 : 0;
+    if (rb_write(s->out, data, len) < 0)
+        return -1;
+    s->audio_bytes += len;
+    return 0;
 }
 
 static void icy_title_cb(void *user, const char *title)
@@ -129,14 +165,24 @@ static size_t write_cb(char *data, size_t size, size_t nmemb, void *userp)
         s->got_body = 1;
         curl_easy_getinfo(s->curl, CURLINFO_RESPONSE_CODE, &code);
         s->http_status = code;
+        /* A hop we are being redirected away from: its body is neither audio
+         * nor the final answer, so swallow it rather than abort the transfer.
+         * header_cb re-arms the latch when the next status line arrives. */
+        if (code >= 300 && code <= 399)
+            return total;
         if (s->on_headers)
             s->on_headers(s->user, s->content_type[0] ? s->content_type : NULL, code);
-        if (code >= 400)
+        /* A 1xx, a 204/205, a 3xx we could not follow or no status line at all
+         * must end the transfer - otherwise the response body is fed to the
+         * decoder as audio while the UI shows a playing station. */
+        if (!status_is_streamable(code))
             return 0;
         icy_init(&s->icy, (size_t)s->metaint, icy_audio_cb, icy_title_cb, s);
     }
 
-    if (s->http_status >= 400)
+    if (s->http_status >= 300 && s->http_status <= 399)
+        return total;
+    if (!status_is_streamable(s->http_status))
         return 0;
     if (icy_feed(&s->icy, (const unsigned char *)data, total) < 0)
         return 0;
@@ -156,7 +202,20 @@ static int xferinfo_cb(void *userp, curl_off_t dltotal, curl_off_t dlnow,
 static void *worker(void *arg)
 {
     HttpStream *s = arg;
-    CURLcode rc = curl_easy_perform(s->curl);
+    CURLcode rc;
+
+    /* No CA bundle is a configuration fault, not a network one: curl's
+     * compile-time default path does not exist on the Vita, so every https
+     * station would fail with an opaque TLS error. Say what is actually wrong. */
+    if (!s->ca_file) {
+        s->result = -1;
+        snprintf(s->errmsg, sizeof(s->errmsg), "no CA bundle configured");
+        rb_close(s->out);
+        atomic_store(&s->finished, 1);
+        return NULL;
+    }
+
+    rc = curl_easy_perform(s->curl);
 
     if (atomic_load(&s->stop)) {
         s->result = 0;
@@ -170,18 +229,42 @@ static void *worker(void *arg)
             if (code > 0 && s->on_headers)
                 s->on_headers(s->user, s->content_type[0] ? s->content_type : NULL, code);
         }
-        if (s->http_status >= 400) {
+        /* Anything but a 2xx is a failure: a 1xx, a 204/205 or a 3xx we could
+         * not follow all end with no stream, and reporting them as a clean end
+         * shows a playing station that is silent. The status is checked before
+         * rc because refusing the body above makes rc CURLE_WRITE_ERROR, which
+         * would hide the far more useful HTTP code. */
+        if (s->http_status > 0 && !status_is_streamable(s->http_status)) {
             s->result = (int)s->http_status;
             snprintf(s->errmsg, sizeof(s->errmsg), "HTTP %ld", s->http_status);
-        } else if (rc == CURLE_OK) {
-            s->result = 0;
-            s->errmsg[0] = '\0';
-        } else {
+        } else if (rc != CURLE_OK) {
             s->result = (int)rc;
             snprintf(s->errmsg, sizeof(s->errmsg), "%s",
                      s->errbuf[0] ? s->errbuf : curl_easy_strerror(rc));
+        } else if (s->http_status == 0) {
+            /* curl is happy but no status line ever arrived. */
+            s->result = -1;
+            snprintf(s->errmsg, sizeof(s->errmsg), "no HTTP response");
+        } else if (s->audio_bytes == 0) {
+            /* A 2xx that ended without handing over a single audio byte: the
+             * station connected and played nothing, so calling it a clean end
+             * shows a working station that is silent. Every transport failure
+             * is caught above, which keeps "never connected" distinct from
+             * "connected and sent nothing". */
+            s->result = -1;
+            snprintf(s->errmsg, sizeof(s->errmsg),
+                     "HTTP %ld, no audio received", s->http_status);
+        } else {
+            s->result = 0;
+            s->errmsg[0] = '\0';
         }
     }
+
+    /* Non-fatal, but the session played with metadata left in the audio, so
+     * say so instead of letting it look like a station with no metadata. */
+    if (s->result == 0 && s->metaint_bad && s->errmsg[0] == '\0')
+        snprintf(s->errmsg, sizeof(s->errmsg), "ignored bad icy-metaint \"%s\"",
+                 s->metaint_raw);
 
     rb_close(s->out);
     atomic_store(&s->finished, 1);
@@ -238,6 +321,11 @@ HttpStream *http_stream_start(const HttpStreamConfig *cfg)
         curl_easy_setopt(c, CURLOPT_USERAGENT, s->user_agent);
     curl_easy_setopt(c, CURLOPT_HTTPHEADER, s->headers);
     curl_easy_setopt(c, CURLOPT_FOLLOWLOCATION, 1L);
+    /* Follow redirects, but never let an https station be walked down to
+     * plaintext http by a Location header. */
+    curl_easy_setopt(c, CURLOPT_REDIR_PROTOCOLS_STR,
+                     (strlen(s->url) >= 8 && ci_equal_n(s->url, "https://", 8))
+                         ? "https" : "http,https");
     curl_easy_setopt(c, CURLOPT_MAXREDIRS, 8L);
     curl_easy_setopt(c, CURLOPT_CONNECTTIMEOUT, 15L);
     curl_easy_setopt(c, CURLOPT_LOW_SPEED_LIMIT, 1L);

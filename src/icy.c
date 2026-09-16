@@ -117,8 +117,14 @@ int icy_extract_title(const char *meta, size_t len, char *out, size_t outsz)
         return 0;
 
     vlen = (size_t)(end - start);
-    if (vlen > outsz - 1)
+    if (vlen > outsz - 1) {
         vlen = outsz - 1;
+        /* Titles are UTF-8. Cutting one mid-sequence leaves bare continuation
+         * bytes for the text renderer to choke on, so back the cut up to the
+         * start of the character it landed inside. */
+        while (vlen > 0 && ((unsigned char)start[vlen] & 0xC0) == 0x80)
+            vlen--;
+    }
     memcpy(out, start, vlen);
     out[vlen] = '\0';
     return 1;

@@ -100,6 +100,16 @@ static void ts_pkt_af_only(unsigned char *p, int pid, int cc)
     memset(p + 6, 0xFF, PKT - 6);
 }
 
+/* Like ts_pkt() with an adaptation field, but with discontinuity_indicator
+ * set: the sender is telling us the break is deliberate, not packet loss. */
+static void ts_pkt_disc(unsigned char *p, int pid, int pusi, int cc, int aflen,
+                        const unsigned char *pay, size_t plen)
+{
+    ts_pkt(p, pid, pusi, cc, aflen, pay, plen);
+    if (aflen > 0)
+        p[5] = 0x80;
+}
+
 static void ts_pkt_null(unsigned char *p)
 {
     unsigned char pay[184];
@@ -304,7 +314,7 @@ int main(void)
 
     /* ---- the other audio stream types ------------------------------ */
     {
-        int types[3] = { 0x04, 0x11, 0x03 };
+        int types[3] = { 0x04, 0x0F, 0x03 };
         int all = 1, k;
         for (k = 0; k < 3; k++) {
             build_stream(400, types[k], 0, -1, 0);
@@ -313,7 +323,7 @@ int main(void)
                 all = 0;
             ts_demux_close(t);
         }
-        CHECK("stream_types_04_11_03", all);
+        CHECK("stream_types_04_0F_03", all);
     }
 
     /* A PMT naming only a video stream must leave stream_type at 0. */
@@ -502,11 +512,14 @@ int main(void)
         memcpy(g + at, strm + at + PKT, slen - at - PKT);
         run_whole(g, slen - PKT, &sink, &t);
         CHECK("cc_error_counted", ts_demux_cc_errors(t) == 1);
-        /* the surviving packets are still emitted, in order */
-        CHECK("cc_error_keeps_streaming", sink.n == n - 184);
+        /* The packets after the gap are NOT spliced onto the ones before it:
+         * the missing 184 bytes are the middle of an AAC frame, and joining
+         * the two halves just hands the decoder a frame that is wrong in a
+         * way it cannot see. Only the bytes up to the gap are emitted, and
+         * the stream picks up again at the next PUSI. */
+        CHECK("cc_error_stops_at_the_gap", sink.n == 175);
         CHECK("cc_error_bytes_are_the_right_ones",
-              memcmp(sink.b, es_src, 175) == 0 &&
-              memcmp(sink.b + 175, es_src + 175 + 184, n - 175 - 184) == 0);
+              memcmp(sink.b, es_src, 175) == 0);
         ts_demux_close(t);
     }
 
@@ -596,6 +609,126 @@ int main(void)
         sink_init(&sink);
         ts_demux_feed(d, strm, slen, sink_fn, &sink);
         CHECK("bad_start_code_not_emitted", sink.n == 0);
+        ts_demux_close(d);
+    }
+
+    /* ---- the resync budget is per call, not per object --------------- */
+    /* One segment that is not TS at all (an HTML error page, an fMP4 chunk)
+     * must not poison the demuxer for the rest of the session. */
+    {
+        Sink s2;
+        TsDemux *d = ts_demux_open();
+        memset(big, 0x11, sizeof big);
+        sink_init(&s2);
+        CHECK("junk_segment_gives_minus_one",
+              ts_demux_feed(d, big, sizeof big, sink_fn, &s2) == -1);
+        build_stream(359, 0x0F, 0, -1, 0);
+        sink_init(&s2);
+        CHECK("valid_ts_after_junk_ok",
+              ts_demux_feed(d, strm, slen, sink_fn, &s2) == 0);
+        CHECK("valid_ts_after_junk_es", es_matches(&s2, 359));
+        CHECK("valid_ts_after_junk_type", ts_demux_stream_type(d) == 0x0F);
+        ts_demux_close(d);
+    }
+    /* The same, spread over two junk feeds: neither call exceeds the budget,
+     * so neither may fail, and the stream after them still plays. */
+    {
+        Sink s2;
+        TsDemux *d = ts_demux_open();
+        memset(big, 0x11, sizeof big);
+        sink_init(&s2);
+        CHECK("junk_half_one_ok", ts_demux_feed(d, big, 40000, sink_fn, &s2) == 0);
+        CHECK("junk_half_two_ok", ts_demux_feed(d, big, 40000, sink_fn, &s2) == 0);
+        build_stream(359, 0x0F, 0, -1, 0);
+        sink_init(&s2);
+        CHECK("valid_ts_after_split_junk_es",
+              ts_demux_feed(d, strm, slen, sink_fn, &s2) == 0 && es_matches(&s2, 359));
+        ts_demux_close(d);
+    }
+
+    /* ---- a continuity break must not splice the two sides together ---- */
+    {
+        unsigned char sec[256], pay[184];
+        size_t sl, hl;
+        TsDemux *d = ts_demux_open();
+        s_reset();
+        sl = build_pat(sec, PMT_PID);       psi_pkt(s_pkt(), 0x0000, 0, 0, sec, sl);
+        sl = build_pmt(sec, AUD_PID, 0x0F); psi_pkt(s_pkt(), PMT_PID, 0, 0, sec, sl);
+        hl = pes_hdr_build(pay, 600, 0);
+        memcpy(pay + hl, es_src, 184 - hl);
+        ts_pkt(s_pkt(), AUD_PID, 1, 0, -1, pay, 184);             /* cc 0 */
+        ts_pkt(s_pkt(), AUD_PID, 0, 5, -1, es_src + 175, 184);    /* 4 lost */
+        ts_pkt(s_pkt(), AUD_PID, 0, 6, -1, es_src + 359, 184);
+        sink_init(&sink);
+        ts_demux_feed(d, strm, slen, sink_fn, &sink);
+        CHECK("cc_gap_counted", ts_demux_cc_errors(d) == 1);
+        CHECK("cc_gap_stops_at_the_gap", sink.n == 175);
+        /* The next PUSI restarts the PES: bytes flow again. */
+        s_reset();
+        hl = pes_hdr_build(pay, 400, 0);
+        memcpy(pay + hl, es_src, 184 - hl);
+        ts_pkt(s_pkt(), AUD_PID, 1, 7, -1, pay, 184);
+        ts_demux_feed(d, strm, slen, sink_fn, &sink);
+        CHECK("cc_gap_recovers_on_next_pusi", sink.n == 350);
+        ts_demux_close(d);
+    }
+    /* A signalled discontinuity is not packet loss, so it is not counted. */
+    {
+        unsigned char sec[256], pay[184];
+        size_t sl, hl;
+        TsDemux *d = ts_demux_open();
+        s_reset();
+        sl = build_pat(sec, PMT_PID);       psi_pkt(s_pkt(), 0x0000, 0, 0, sec, sl);
+        sl = build_pmt(sec, AUD_PID, 0x0F); psi_pkt(s_pkt(), PMT_PID, 0, 0, sec, sl);
+        hl = pes_hdr_build(pay, 600, 0);
+        memcpy(pay + hl, es_src, 184 - hl);
+        ts_pkt(s_pkt(), AUD_PID, 1, 0, -1, pay, 184);
+        ts_pkt_disc(s_pkt(), AUD_PID, 0, 5, 1, es_src + 175, 182);
+        sink_init(&sink);
+        ts_demux_feed(d, strm, slen, sink_fn, &sink);
+        CHECK("signalled_discontinuity_not_counted", ts_demux_cc_errors(d) == 0);
+        ts_demux_close(d);
+    }
+
+    /* ---- LATM AAC (stream_type 0x11) is not a stream we can decode ---- */
+    /* decoder.c maps VR_CODEC_AAC to AV_CODEC_ID_AAC only, so claiming a LATM
+     * PID gives a silent stream with no error. Fall through to the next ES. */
+    {
+        TsDemux *d = ts_demux_open();
+        build_stream(400, 0x11, 0, -1, 0);
+        sink_init(&sink);
+        ts_demux_feed(d, strm, slen, sink_fn, &sink);
+        CHECK("latm_not_claimed_type", ts_demux_stream_type(d) == 0);
+        CHECK("latm_not_emitted", sink.n == 0);
+        ts_demux_close(d);
+    }
+
+    /* ---- a section too long for the buffer is dropped, not left open -- */
+    /* section_length is 12 bits (up to 4093 bytes of payload) but Section.buf
+     * holds 1024, so such a section can never complete. */
+    {
+        unsigned char sec[256], pay[184];
+        size_t sl;
+        TsDemux *d = ts_demux_open();
+        s_reset();
+        sl = build_pat(sec, PMT_PID);
+        sec[1] = (unsigned char)(0xB0 | ((2000 >> 8) & 0x0F));   /* claims 2000 */
+        sec[2] = (unsigned char)(2000 & 0xFF);
+        psi_pkt(s_pkt(), 0x0000, 0, 0, sec, sl);
+        memset(pay, 0xFF, sizeof pay);
+        ts_pkt(s_pkt(), 0x0000, 0, 1, -1, pay, 184);   /* continuation, no PUSI */
+        ts_pkt(s_pkt(), 0x0000, 0, 2, -1, pay, 184);
+        sl = build_pat(sec, PMT_PID);                  /* a real PAT, at last */
+        psi_pkt(s_pkt(), 0x0000, 3, 0, sec, sl);
+        sl = build_pmt(sec, AUD_PID, 0x0F); psi_pkt(s_pkt(), PMT_PID, 0, 0, sec, sl);
+        {
+            int cc = 0;
+            emit_es(AUD_PID, &cc, es_src, 400, 0, -1);
+        }
+        sink_init(&sink);
+        ts_demux_feed(d, strm, slen, sink_fn, &sink);
+        CHECK("oversized_section_then_real_pat", ts_demux_stream_type(d) == 0x0F);
+        CHECK("oversized_section_es_exact", es_matches(&sink, 400));
         ts_demux_close(d);
     }
 

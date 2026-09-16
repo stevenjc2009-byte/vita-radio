@@ -96,6 +96,43 @@ int main(void)
     chk("res_base_query_dropped", "http://h.example/a/b.m3u8?token=1", "s.ts",
         "http://h.example/a/s.ts");
 
+    /* ---- RFC 3986 5.4.1 references that keep the base's path -------- */
+    /* A query-only reference replaces the query and keeps the whole path,
+       including the last segment. Token-refresh playlists use this form. */
+    chk("res_query_only_keeps_last_segment", "http://a/b/c/d;p?q", "?y",
+        "http://a/b/c/d;p?y");
+    chk("res_query_only_hls", "https://cdn.example/live/master.m3u8?token=abc",
+        "?token=xyz", "https://cdn.example/live/master.m3u8?token=xyz");
+    /* A fragment-only reference keeps the base's path AND its query. */
+    chk("res_fragment_only_keeps_path_and_query", "http://a/b/c/d;p?q", "#s",
+        "http://a/b/c/d;p?q#s");
+
+    /* ---- empty path segments survive normalisation ------------------ */
+    /* RFC 3986 5.2.4 removes only "." and ".."; "//" inside a path is a real
+       empty segment and the server will 404 without it. */
+    chk("res_empty_segment_kept", "https://cdn.example/a//b/p.m3u8", "s.ts",
+        "https://cdn.example/a//b/s.ts");
+    chk("res_empty_segment_in_ref", "https://cdn.example/a/p.m3u8", "x//y.ts",
+        "https://cdn.example/a/x//y.ts");
+
+    /* ---- too many segments is an error, never a truncated URL ------- */
+    {
+        char deep[1400];
+        size_t pos = 0;
+        for (int i = 0; i < 200 && pos + 2 < sizeof(deep); i++) {
+            deep[pos++] = 's';
+            deep[pos++] = '/';
+        }
+        pos += (size_t)snprintf(deep + pos, sizeof(deep) - pos, "f.ts");
+        deep[pos] = '\0';
+
+        char out[2048];
+        int rc = url_resolve("http://h.example/", deep, out, sizeof(out));
+        /* Dropping segments silently would return 0 with the filename gone. */
+        CHECK("err_segment_cap_rejected",
+              rc == -1 || strstr(out, "f.ts") != NULL);
+    }
+
     /* ---- bases without a path -------------------------------------- */
     chk("res_base_no_path", "http://h.example", "seg.ts", "http://h.example/seg.ts");
     chk("res_base_root", "http://h.example/", "seg.ts", "http://h.example/seg.ts");

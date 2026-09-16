@@ -27,7 +27,8 @@
 #define POLL_US          20000
 #define THREAD_STACK     (256 * 1024)
 #define REAPER_STACK     (32 * 1024)
-#define SHUTDOWN_WAIT_MS 20000   /* > curl's 15 s connect timeout */
+#define MAX_REAPERS      4       /* concurrent background stops; see player_play */
+#define SHUTDOWN_WAIT_MS 35000   /* covers http_get's fixed 30 s timeout; see player_shutdown */
 #define MAX_SOURCE_HOPS  2       /* .pls -> .m3u8 -> media is the deepest real case */
 
 /* One connection: its own ring buffer, so an abandoned connection that is
@@ -72,11 +73,16 @@ static void copy_str(char *dst, size_t dstsz, const char *src)
     snprintf(dst, dstsz, "%s", src);
 }
 
-static long now_ms(void)
+/* int64 rather than long: vitasdk does not document whether CLOCK_MONOTONIC is
+ * since-boot or epoch-based, and on a 32-bit long an epoch-based tv_sec would
+ * overflow the * 1000 on the very first call, feeding garbage to the underrun
+ * detector and the shutdown deadline. Widening removes the dependency on an
+ * assumption nobody has checked. */
+static int64_t now_ms(void)
 {
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
-    return (long)ts.tv_sec * 1000L + ts.tv_nsec / 1000000L;
+    return (int64_t)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
 }
 
 static void set_error(const char *fmt, ...)
@@ -235,8 +241,9 @@ static int on_pcm(void *user, const int16_t *pcm, int frames)
         pthread_mutex_unlock(&g_lock);
     }
     if (audio_out_write(g_audio, pcm, frames) < 0) {
+        if (!ctx->failed)          /* report it once, not once per grain */
+            set_error("Audio output failed");
         ctx->failed = 1;
-        set_error("Audio output failed");
         return -1;
     }
     return 0;
@@ -461,7 +468,7 @@ open_source:
     free(pre);
     pre = NULL;
 
-    long last_data = now_ms();
+    int64_t last_data = now_ms();
     for (;;) {
         if (atomic_load(&g_stop))
             break;
@@ -490,6 +497,29 @@ open_source:
     }
 
 out:
+    /* Leaving for our own reason - a decode error, the end of the stream, a
+     * failed swap - used to leave the connection installed. Its worker would
+     * keep downloading until the 256 KB ring filled and then park in rb_write
+     * with nothing reading it, pinning a thread, a socket and the buffer until
+     * the user next pressed play or stop. The failed-swap path was worse: it
+     * has already bumped g_gen and cleared content_type/http_status, so the
+     * still-live old source's callbacks were being discarded and the reported
+     * status no longer described the connection that was actually running.
+     *
+     * When g_stop is set the Conn belongs to player_stop, which takes it under
+     * the same lock - so exactly one of us retires it, never both. */
+    pthread_mutex_lock(&g_http_lock);
+    Conn *dead = NULL;
+    if (!atomic_load(&g_stop)) {
+        dead = g_conn;
+        g_conn = NULL;
+        g_http = NULL;
+        g_hls = NULL;
+        g_rb = NULL;
+    }
+    pthread_mutex_unlock(&g_http_lock);
+    conn_release(dead);   /* outside the lock: it may spawn a reaper */
+
     free(pre);
     free(buf);
     return NULL;
@@ -520,6 +550,11 @@ static void *reap_thread(void *arg)
         hls_stream_stop(c->hls);
     rb_free(&c->rb);
     free(c);
+    /* Last statement on purpose: every resource this Conn owned is gone before
+     * the count drops, so a shutdown that sees zero is not waiting on one of
+     * them. It still is not proof the thread has terminated - it has its own
+     * unwind to do after this - but by here it owns nothing and is no longer
+     * inside libcurl. */
     atomic_fetch_sub(&g_reapers, 1);
     return NULL;
 }
@@ -543,11 +578,15 @@ static void conn_release(Conn *c)
         if (rc == 0)
             return;
         atomic_fetch_sub(&g_reapers, 1);
-        /* no thread available: stop inline */
-        if (c->http)
-            http_stream_stop(c->http);
-        if (c->hls)
-            hls_stream_stop(c->hls);
+        /* No thread available. Stopping inline is not an option here: this can
+         * run on the UI thread (player_stop), and the blocking stop is the one
+         * thing the reaper exists to keep off it - it would freeze the UI for
+         * the whole DNS/connect time. The ring is already aborted, so the
+         * worker's writes fail and it winds itself down; the Conn is leaked
+         * deliberately rather than trading a leak for a frozen UI. Reaching
+         * this at all needs the thread cap to be exhausted, which player_play
+         * now bounds. */
+        return;
     }
     rb_free(&c->rb);
     free(c);
@@ -574,6 +613,16 @@ void player_play(const char *url)
     }
     if (!url || !url[0]) {
         set_error("No URL");
+        return;
+    }
+    /* Bound the fan-out. Every background stop still owns a curl worker, a
+     * socket and a 256 KB ring, and against a dead host it lives for the whole
+     * connect timeout - twenty rapid station changes would otherwise stack up
+     * twenty of each. Refusing is deliberate: waiting here for room would put
+     * the stall back on the UI thread, which is exactly what the reapers
+     * exist to prevent. */
+    if (atomic_load(&g_reapers) >= MAX_REAPERS) {
+        set_error("Too many connections still closing");
         return;
     }
 
@@ -647,8 +696,9 @@ void player_stop(void)
         rb_abort(&c->rb);   /* unblocks the decode thread's read and the worker's write */
 
     /* The decode thread only ever waits on the ring buffer, a 20 ms poll or one
-     * audio grain, so this join is short. The network worker may be stuck in
-     * DNS/connect for up to 15 s, so it is reaped in the background. */
+     * audio grain, so this join is short. The network worker has no such bound
+     * - a synchronous DNS lookup ignores CURLOPT_CONNECTTIMEOUT entirely - so
+     * it is reaped in the background instead of joined here. */
     if (g_thread_running) {
         pthread_join(g_thread, NULL);
         g_thread_running = 0;
@@ -683,8 +733,16 @@ void player_shutdown(void)
     if (!g_inited)
         return;
     player_stop();
-    /* Let background stops finish before curl and the network are torn down. */
-    long end = now_ms() + SHUTDOWN_WAIT_MS;
+    /* Let background stops finish before curl and the network are torn down.
+     *
+     * This is a best-effort wait, NOT a guarantee. 35 s covers http_get's fixed
+     * 30 s timeout, but the vendored resolver is synchronous, so
+     * CURLOPT_CONNECTTIMEOUT does not bound a DNS lookup at all and there is no
+     * abort hook to cut one short: a reaper can still outlive this deadline. If
+     * it does, we return anyway and the caller tears down curl while a detached
+     * thread is still inside it. Making that impossible needs the reapers to be
+     * joinable, which is a redesign, not a constant. */
+    int64_t end = now_ms() + SHUTDOWN_WAIT_MS;
     while (atomic_load(&g_reapers) > 0 && now_ms() < end)
         usleep(POLL_US);
     audio_out_close(g_audio);

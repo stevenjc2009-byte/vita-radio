@@ -218,6 +218,15 @@ static void wait_for_state(PlayerState want, int timeout_ms, PlayerStatus *st)
     } while (now_ms() < end);
 }
 
+/* Reapers are detached, so the count they drive drops some time after the call
+ * that spawned them returned. */
+static void wait_for_live(int want, int timeout_ms)
+{
+    long end = now_ms() + timeout_ms;
+    while (atomic_load(&fake_live) > want && now_ms() < end)
+        usleep(10 * 1000);
+}
+
 int main(void)
 {
     PlayerStatus st;
@@ -338,6 +347,45 @@ int main(void)
     fake_body = NULL;
     player_shutdown();
     check(atomic_load(&fake_live) == 0, "%d streams still alive after swap shutdown",
+          atomic_load(&fake_live));
+
+    /* ---- connection lifetime when nobody stops the player ---------------- */
+
+    check(player_init("test", NULL) == 0, "player_init for the lifetime tests");
+
+    /* 10. a decode thread that leaves for its own reason retires its
+     * connection. Without that the source stays installed after the error
+     * toast: its worker keeps downloading until the 256 KB ring fills and then
+     * parks in rb_write forever, pinning a thread, a socket and the buffer
+     * until the user happens to press play or stop again. */
+    atomic_store(&fake_block_ms, 0);
+    fake_body = NULL;                 /* no body: the run ends in "Stream ended" */
+    player_play("http://selfend/");
+    wait_for_state(PLAYER_ERROR, 3000, &st);
+    check(st.state == PLAYER_ERROR, "self-end: state %d (want ERROR)", st.state);
+    wait_for_live(0, 2000);
+    check(atomic_load(&fake_live) == 0,
+          "self-end: %d connections still live after the error, with no stop",
+          atomic_load(&fake_live));
+    player_stop();
+    wait_for_live(0, 2000);
+
+    /* 11. the reaper fan-out is capped. Rapid switches against hosts that will
+     * not answer must not stack up one worker, one socket and one 256 KB ring
+     * per abandoned station; past the cap a new connection is refused rather
+     * than started, because waiting for room would put the stall back on the
+     * UI thread. */
+    atomic_store(&fake_block_ms, 1500);
+    int peak = 0;
+    for (int i = 0; i < 12; i++) {
+        player_play("http://dead/");
+        int live = atomic_load(&fake_live);
+        if (live > peak)
+            peak = live;
+    }
+    check(peak <= 5, "reaper fan-out peaked at %d live connections (want <= 5)", peak);
+    player_shutdown();
+    check(atomic_load(&fake_live) == 0, "%d connections still alive after the cap test",
           atomic_load(&fake_live));
 
     printf("test_player: %d passed, %d failed\n", passed, failed);

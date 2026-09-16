@@ -36,8 +36,9 @@ static size_t put_adts(unsigned char *b, size_t fl, unsigned seed)
     return fl;
 }
 
-/* ID3v2.4 tag with a syncsafe size. Two chained 7-byte ADTS frames are planted
- * in the body: if the tag is not skipped whole, they leak into the output. */
+/* ID3v2.4 tag with a syncsafe size. Two chained 8-byte ADTS frames (the
+ * smallest with a payload) are planted in the body: if the tag is not skipped
+ * whole, they leak into the output. */
 static size_t put_id3(unsigned char *b, size_t body, int footer)
 {
     size_t n = 10 + body + (footer ? 10 : 0);
@@ -48,9 +49,9 @@ static size_t put_id3(unsigned char *b, size_t body, int footer)
     b[8] = (unsigned char)((body >> 7) & 0x7F);
     b[9] = (unsigned char)(body & 0x7F);
     memset(b + 10, 0, body);
-    if (body >= 14) {
-        put_adts(b + 10, 7, 0);
-        put_adts(b + 17, 7, 0);
+    if (body >= 16) {
+        put_adts(b + 10, 8, 0);
+        put_adts(b + 18, 8, 0);
     }
     if (footer)
         memcpy(b + 10 + body, "3DI\x04\x00\x10\x00\x00\x07\x68", 10);
@@ -95,7 +96,7 @@ int main(void)
     e = 0;
     e += put_adts(exp + e, 200, 1);
     e += put_adts(exp + e, 311, 2);
-    e += put_adts(exp + e, 7,   3);
+    e += put_adts(exp + e, 8,   3);
     e += put_adts(exp + e, 450, 4);
     memcpy(in, exp, e);
     memset(&s, 0, sizeof s);
@@ -345,6 +346,85 @@ int main(void)
     CHECK("bytewise_output", same(&s, exp, e));
     CHECK("bytewise_tags", adts_scan_tags_dropped(a) == 2);
     CHECK("bytewise_no_skips", adts_scan_bytes_skipped(a) == 0);
+    adts_scan_close(a);
+
+    /* ---- an absurd tag size is a corrupt header, not a 268 MB tag ----- */
+    /* One believed header would black the station out for the rest of the
+     * segment while the network keeps paying for the bytes. */
+    e = 0;
+    e += put_adts(exp + e, 200, 60);
+    e += put_adts(exp + e, 200, 61);
+    e += put_adts(exp + e, 200, 62);
+    n = 0;
+    memcpy(in + n, "ID3\x04\x00\x00\x7F\x7F\x7F\x7F", 10); n += 10;
+    memcpy(in + n, exp, e); n += e;
+    memset(&s, 0, sizeof s);
+    a = adts_scan_open();
+    CHECK("huge_tag_feed_ok", adts_scan_feed(a, in, n, sink_fn, &s) == 0);
+    CHECK("huge_tag_audio_survives", same(&s, exp, e));
+    CHECK("huge_tag_not_counted", adts_scan_tags_dropped(a) == 0);
+    CHECK("huge_tag_resyncs_bytewise", adts_scan_bytes_skipped(a) == 10);
+    adts_scan_close(a);
+
+    /* ---- a skip long enough to outrun the buffer must be re-validated -- */
+    /* The tag length is only a claim. Where it says the audio resumes, a lone
+     * 0xFFF is not proof of a frame: the length it declares has to land on
+     * something real, exactly as when sync is first acquired. */
+    e = 0;
+    e += put_adts(exp + e, 200, 63);
+    e += put_adts(exp + e, 200, 64);
+    n = 0;
+    memcpy(in + n, exp, e); n += e;
+    n += put_id3(in + n, 20000, 0);
+    put_adts_hdr(in + n, 300); n += 7;     /* claims 300 bytes, lands on junk */
+    e += put_adts(exp + e, 200, 65);
+    e += put_adts(exp + e, 200, 66);
+    e += put_adts(exp + e, 200, 67);
+    memcpy(in + n, exp + 400, e - 400); n += e - 400;
+    memset(&s, 0, sizeof s);
+    a = adts_scan_open();
+    CHECK("long_skip_feed_ok", adts_scan_feed(a, in, n, sink_fn, &s) == 0);
+    CHECK("long_skip_revalidates", same(&s, exp, e));
+    CHECK("long_skip_tag_counted", adts_scan_tags_dropped(a) == 1);
+    adts_scan_close(a);
+
+    /* ---- a header-only frame carries no payload ------------------------ */
+    /* frame_length counts the header too, so 7 (or 9 with the CRC) means the
+     * frame is empty: forwarding it hands libavcodec nothing to decode. */
+    e = 0;
+    e += put_adts(exp + e, 200, 68);
+    e += put_adts(exp + e, 200, 69);
+    n = 0;
+    put_adts_hdr(in + n, 7); n += 7;
+    memcpy(in + n, exp, e); n += e;
+    memset(&s, 0, sizeof s);
+    a = adts_scan_open();
+    CHECK("empty_frame_feed_ok", adts_scan_feed(a, in, n, sink_fn, &s) == 0);
+    CHECK("empty_frame_dropped", same(&s, exp, e));
+    CHECK("empty_frame_skipped", adts_scan_bytes_skipped(a) == 7);
+    adts_scan_close(a);
+
+    n = 0;
+    put_adts_hdr(in + n, 9); in[1] = 0xF0; n += 9;   /* CRC present: 9-byte hdr */
+    memcpy(in + n, exp, e); n += e;
+    memset(&s, 0, sizeof s);
+    a = adts_scan_open();
+    CHECK("empty_crc_frame_feed_ok", adts_scan_feed(a, in, n, sink_fn, &s) == 0);
+    CHECK("empty_crc_frame_dropped", same(&s, exp, e));
+    CHECK("empty_crc_frame_skipped", adts_scan_bytes_skipped(a) == 9);
+    adts_scan_close(a);
+
+    /* The smallest frame that does carry a payload is still forwarded. */
+    e = 0;
+    e += put_adts(exp + e, 200, 70);
+    e += put_adts(exp + e, 8,   71);
+    e += put_adts(exp + e, 200, 72);
+    memcpy(in, exp, e);
+    memset(&s, 0, sizeof s);
+    a = adts_scan_open();
+    CHECK("one_byte_payload_kept", adts_scan_feed(a, in, e, sink_fn, &s) == 0 &&
+                                   same(&s, exp, e));
+    CHECK("one_byte_payload_no_skips", adts_scan_bytes_skipped(a) == 0);
     adts_scan_close(a);
 
     /* ---- degenerate inputs -------------------------------------------- */

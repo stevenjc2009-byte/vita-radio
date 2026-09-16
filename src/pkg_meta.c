@@ -106,25 +106,66 @@ int headbin_make(const uint8_t *tmpl, size_t size, const char *title_id,
     memset(out + 0x30, 0, 48);
     memcpy(out + 0x30, full_id, strlen(full_id));
 
+    /* Every bound below is a subtraction against a value already known to fit,
+     * never an addition: size_t is 32-bit on the Vita, so a template offset
+     * near 0xFFFFFFFF would wrap an addition and pass. size >= 0xF0 here. */
+
     /* header */
     uint32_t len = be32(out + 0xD0);
-    if ((size_t)len + 16 > size)
+    if (len > size - 16)
         return -1;
     fpkg_hmac(out, len, hmac);
     memcpy(out + len, hmac, 16);
 
     /* package info */
     uint32_t off = be32(out + 0x8), ilen = be32(out + 0x10), dst = be32(out + 0xD4);
-    if (ilen < 64 || (size_t)off + ilen - 64 > size || (size_t)dst + 16 > size)
+    if (ilen < 64 || off > size || ilen - 64 > size - off || dst > size - 16)
         return -1;
     fpkg_hmac(out + off, ilen - 64, hmac);
     memcpy(out + dst, hmac, 16);
 
     /* everything */
     len = be32(out + 0xE8);
-    if ((size_t)len + 16 > size)
+    if (len > size - 16)
         return -1;
     fpkg_hmac(out, len, hmac);
     memcpy(out + len, hmac, 16);
     return 0;
+}
+
+/* ---- update handover token ------------------------------------------------ */
+
+_Static_assert(sizeof(UpdateToken) == 76,
+               "UpdateToken must be the same size in the app and the updater title");
+
+static void sfo_digest(const uint8_t *sfo, size_t sfo_len, uint8_t out[20])
+{
+    Sha1 ctx;
+    sha1_init(&ctx);
+    sha1_update(&ctx, sfo, sfo_len);
+    sha1_final(&ctx, out);
+}
+
+void update_token_build(UpdateToken *t, const char *tag, const uint8_t nonce[16],
+                        const uint8_t *sfo, size_t sfo_len)
+{
+    memset(t, 0, sizeof(*t));
+    t->magic = UPDATE_TOKEN_MAGIC;
+    t->version = UPDATE_TOKEN_VERSION;
+    memcpy(t->nonce, nonce, sizeof(t->nonce));
+    snprintf(t->tag, sizeof(t->tag), "%s", tag ? tag : "");
+    sfo_digest(sfo, sfo_len, t->sfo_sha1);
+}
+
+int update_token_check(const UpdateToken *t, size_t len, const uint8_t *sfo, size_t sfo_len)
+{
+    uint8_t want[20];
+
+    if (!t || len != sizeof(*t) || !sfo || sfo_len == 0)
+        return -1;
+    if (t->magic != UPDATE_TOKEN_MAGIC || t->version != UPDATE_TOKEN_VERSION ||
+        t->tag[UPDATE_TOKEN_TAG_LEN - 1] != '\0')
+        return -1;
+    sfo_digest(sfo, sfo_len, want);
+    return memcmp(want, t->sfo_sha1, sizeof(want)) == 0 ? 0 : -1;
 }

@@ -20,6 +20,10 @@ typedef struct {
     UpdateState state;
     char        latest[32];     /* tag of the latest release, once known */
     char        message[160];   /* one line for the UI */
+    /* 0..100 while UPD_DOWNLOADING, for the progress bar. Stays 0 when the
+     * server sends no Content-Length: a percentage of an unknown total would
+     * be an invented number, so the UI draws an indeterminate bar instead. */
+    unsigned    progress_pct;
 } UpdateStatus;
 
 /* Also picks up the result left by the updater title after an install. */

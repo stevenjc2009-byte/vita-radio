@@ -1,13 +1,12 @@
 # Vita Radio - plain make build (no cmake).
-#   make                 -> build/VitaRadio.vpk
+#   make                 -> build-mbedtls/VitaRadio.vpk (or build-openssl, see TLS)
 #   make BUILD=build-x   -> separate object/output dir
 #   make TLS=openssl     -> force the SDK's curl + OpenSSL instead of vendored curl+mbedTLS
-#   make clean           -> removes $(BUILD) only
+#   make clean           -> removes $(BUILD) only (i.e. the current backend's dir)
 
 VITASDK ?= $(HOME)/vitasdk
 PREFIX  := $(VITASDK)/bin/arm-vita-eabi
 CC      := $(PREFIX)-gcc
-BUILD   ?= build
 
 TITLE     := Vita Radio
 TITLE_ID  := VRAD00001
@@ -22,11 +21,23 @@ TLS ?= mbedtls
 endif
 $(info TLS backend: $(TLS))
 
+# Objects are backend-specific. The two backends compile against DIFFERENT curl
+# headers - vendored third_party/tls-mbedtls/include/curl (8.22.0) vs the SDK's
+# (8.17.0) - but objects depend only on their .c and this Makefile, so nothing
+# in the dependency graph can see the include path change. With a shared object
+# dir `make TLS=openssl` after `make TLS=mbedtls` reported "up to date" and
+# linked the mbedTLS-side objects unchanged: wrong headers, no build error.
+# (Measured 2026-09-16: those objects happen to be byte-identical today, so the
+# hazard is latent rather than live - but it is invisible either way, which is
+# exactly why it is fixed here and not left to be noticed.)
+# Keep this AFTER the TLS block so $(TLS) is already set.
+BUILD ?= build-$(TLS)
+
 SRCS := $(wildcard src/*.c)
 OBJS := $(patsubst src/%.c,$(BUILD)/%.o,$(SRCS))
 DEPS := $(OBJS:.o=.d)
 
-CFLAGS := -std=gnu11 -Wall -Wextra -O2 -Isrc -DCURL_STATICLIB -MMD -MP
+CFLAGS := -std=gnu11 -Wall -Wextra -Werror -O2 -Isrc -DCURL_STATICLIB -MMD -MP
 
 ifeq ($(TLS),mbedtls)
 CFLAGS   += -I$(TLS_DIR)/include
@@ -82,7 +93,9 @@ $(BUILD)/$(VPK_NAME): $(BUILD)/eboot.bin $(BUILD)/param.sfo $(VPK_FILES) \
 $(BUILD)/upd/eboot.bin: $(BUILD)/upd/updater.velf
 	$(VITASDK)/bin/vita-make-fself -s $< $@
 
-$(BUILD)/upd/param.sfo: | $(BUILD)
+# Makefile is a real prerequisite: UPD_TITLE_ID/UPD_TITLE live in it, so an SFO
+# built before an edit to them must be regenerated, not left stale.
+$(BUILD)/upd/param.sfo: Makefile | $(BUILD)
 	mkdir -p $(BUILD)/upd
 	$(VITASDK)/bin/vita-mksfoex -s TITLE_ID=$(UPD_TITLE_ID) -d ATTRIBUTE2=12 "$(UPD_TITLE)" $@
 
@@ -99,7 +112,9 @@ $(BUILD)/upd/%.o: %.c Makefile
 $(BUILD)/eboot.bin: $(BUILD)/$(TARGET).velf
 	$(VITASDK)/bin/vita-make-fself -s $< $@
 
-$(BUILD)/param.sfo: | $(BUILD)
+# Makefile is a real prerequisite: TITLE_ID/TITLE live in it, so a version or
+# title bump regenerates the SFO instead of shipping the previous one.
+$(BUILD)/param.sfo: Makefile | $(BUILD)
 	$(VITASDK)/bin/vita-mksfoex -s TITLE_ID=$(TITLE_ID) -d ATTRIBUTE2=12 "$(TITLE)" $@
 
 $(BUILD)/$(TARGET).velf: $(BUILD)/$(TARGET).elf

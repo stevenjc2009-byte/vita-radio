@@ -77,17 +77,51 @@ int rb_write(RingBuf *rb, const unsigned char *src, size_t len)
     return 0;
 }
 
+/* Milliseconds since *from on a clock nothing can step. */
+static long mono_elapsed_ms(const struct timespec *from)
+{
+    struct timespec now;
+    clock_gettime(CLOCK_MONOTONIC, &now);
+    return (long)(now.tv_sec - from->tv_sec) * 1000L
+         + (now.tv_nsec - from->tv_nsec) / 1000000L;
+}
+
+/* Absolute deadline ms from now, in the clock pthread_cond_timedwait reads. */
+static void wall_deadline_in(struct timespec *out, long ms)
+{
+    clock_gettime(CLOCK_REALTIME, out);
+    out->tv_sec += ms / 1000;
+    out->tv_nsec += (ms % 1000) * 1000000L;
+    if (out->tv_nsec >= 1000000000L) {
+        out->tv_sec += 1;
+        out->tv_nsec -= 1000000000L;
+    }
+}
+
+/* The deadline is on the wall clock, which a Vita time sync or the user
+ * changing the date can step. Pinning the condvar to CLOCK_MONOTONIC via
+ * pthread_condattr_setclock - the obvious fix - does not work on the target:
+ * vitasdk's pthreads-embedded stores the clock in the attr but
+ * pthread_cond_init reads only the attr's pshared field and ignores it, and
+ * pthread_cond_timedwait passes abstime to sem_timedwait -> pte_relmillisecs,
+ * which converts it against ftime() - the wall clock. Handing that a
+ * since-boot monotonic deadline would make every wait expire instantly, so the
+ * deadline has to stay where the implementation expects it.
+ *
+ * What that conversion does give us is immunity to the long stall: the wait is
+ * turned into a relative delay once, on entry, so a step during it moves
+ * nothing. The remaining exposure is a forward step landing between our
+ * clock_gettime and the library's ftime, which would expire the wait early -
+ * and the caller's r == 0 path has no sleep in it, so an early timeout spins a
+ * core. Hence the monotonic reference below: a timeout is only reported once
+ * the time really has passed, and a re-arm never asks for longer than the
+ * caller did. */
 long rb_read(RingBuf *rb, unsigned char *dst, size_t len, int timeout_ms)
 {
-    struct timespec deadline;
+    struct timespec deadline, started;
     if (timeout_ms > 0) {
-        clock_gettime(CLOCK_REALTIME, &deadline);
-        deadline.tv_sec += timeout_ms / 1000;
-        deadline.tv_nsec += (long)(timeout_ms % 1000) * 1000000L;
-        if (deadline.tv_nsec >= 1000000000L) {
-            deadline.tv_sec += 1;
-            deadline.tv_nsec -= 1000000000L;
-        }
+        clock_gettime(CLOCK_MONOTONIC, &started);
+        wall_deadline_in(&deadline, timeout_ms);
     }
 
     pthread_mutex_lock(&rb->lock);
@@ -114,6 +148,11 @@ long rb_read(RingBuf *rb, unsigned char *dst, size_t len, int timeout_ms)
                 return -1;
             }
             if (rb->count == 0) {
+                long left = timeout_ms - mono_elapsed_ms(&started);
+                if (left > 0) {          /* expired early: re-arm, do not spin */
+                    wall_deadline_in(&deadline, left);
+                    continue;
+                }
                 pthread_mutex_unlock(&rb->lock);
                 return 0;
             }

@@ -13,24 +13,30 @@ VitaSDK and vita2d.
   raw ADTS segments, and AES-128 encrypted segments.
 - **Playlist links work** — point it at a `.pls` or `.m3u` and it follows the
   link to the actual stream.
+- **Four tabs** — Stations, Favourites, Search and System — cycled with L/R.
+- **Filter chips** on the Stations tab: Built-in, Popular, Rock, Jazz, News,
+  Classical, Dance, UK and US, pulled live from the radio-browser.info
+  directory.
+- **Four colour themes** — Midnight, Deep blue, True black and Graphite —
+  picked in System → Theme and remembered between sessions.
 - **Search** the radio-browser.info directory from the console (SQUARE) using
   the Vita's on-screen keyboard.
-- **Favourites** (SELECT), saved between sessions and starred wherever the
-  station appears. L/R cycles Built-in, Favourites and Search.
+- **Favourites** (TRIANGLE), saved between sessions and starred wherever the
+  station appears.
 - **Live stream info:** state, ICY track title, codec, sample rate, channels,
   HTTP status, buffer fill and bytes received.
 - **HTTPS streams** with certificate verification against a bundled CA store.
 - **Fast station switching** — starting a new station never waits on the old
   one's socket to close.
-- **Built-in updater:** *Check for Updates* (TRIANGLE) downloads and installs
-  the latest GitHub release, then restarts itself.
+- **Built-in updater** on the System tab: downloads and installs the latest
+  GitHub release with a progress bar, then restarts itself.
 
 ## Install
 
-<img src="docs/install-qr.png" alt="QR code for the VitaRadio.vpk 2.0.0 download" width="200" align="right">
+<img src="docs/install-qr.png" alt="QR code for the VitaRadio.vpk 3.0.0 download" width="200" align="right">
 
 Scan the code with the Vita's own browser (**Browser → ☰ → QR code reader**) and
-it downloads `VitaRadio.vpk` for 2.0.0 straight to the console — no PC, no USB.
+it downloads `VitaRadio.vpk` for 3.0.0 straight to the console — no PC, no USB.
 Then install the downloaded file with VitaShell.
 
 Or do it by hand:
@@ -42,28 +48,42 @@ Or do it by hand:
    it to install the package it downloads.
 
 From 1.0.0 onwards you only have to do this once: later versions arrive through
-*Check for Updates* (TRIANGLE) inside the app.
+the **System** tab's *Check for updates* row inside the app.
 
 ## Controls
 
 | Button | Action |
 | --- | --- |
-| Up / Down | Move through the station list (hold to repeat) |
-| L / R | Switch list: Built-in, Favourites, Search |
-| X | Play the selected station |
+| L / R | Switch tab: Stations, Favourites, Search, System |
+| Up / Down | Move through the list, or between System rows (hold to repeat) |
+| Left / Right | Pick a filter chip (Stations), or change the value (System) |
+| X | Play the selected station, or activate the System row |
 | O | Stop playback |
+| TRIANGLE | Add or remove the selected station from Favourites |
 | SQUARE | Search for stations (opens the on-screen keyboard) |
-| SELECT | Add or remove the selected station from Favourites |
-| TRIANGLE | Check for updates; press again to install one |
+| SELECT | Jump straight to the System tab |
 | START | Quit |
+
+Moving onto a filter chip fetches it straight away, so Left/Right on the
+Stations tab is a network request each press.
 
 ## Building (WSL + VitaSDK)
 
 ```bash
 export VITASDK=$HOME/vitasdk   # wherever your VitaSDK lives
-make                      # -> build/VitaRadio.vpk
+make                      # -> build-mbedtls/VitaRadio.vpk
+make TLS=openssl          # -> build-openssl/VitaRadio.vpk
 make BUILD=build-verify   # build into a separate directory
 ```
+
+The object directory defaults to `build-$(TLS)`, so the two TLS backends never
+share objects — they compile against different curl headers (vendored 8.22.0
+for mbedTLS, the SDK's 8.17.0 for OpenSSL) and nothing in the dependency graph
+can see that change, so a shared directory would silently link the wrong ones.
+`make clean` removes the current backend's directory only.
+
+The build runs with `-Werror`; it is warning-clean on
+`arm-vita-eabi-gcc` 15.2.0.
 
 17 host unit test suites cover the pure-C modules — ring buffer, ICY parser,
 format sniffer, player lifecycle, `.pls`/`.m3u` playlists, URL resolution, the
@@ -73,8 +93,21 @@ head.bin and the zip extractor. They build outside the SDK, under ASan and
 UBSan:
 
 ```bash
-make -C tests
+make -C tests                          # build + run all 17 suites
+make -C tests BUILD=build-host-x       # separate object dir (parallel runs)
 ```
+
+The run is gated so it cannot pass by doing less work than it should:
+
+- **Suite count.** `EXPECT_TESTS` in `tests/Makefile` pins the number of
+  `test_*.c` files at 17. A deleted or renamed suite fails the run instead of
+  quietly shrinking it. **Bump `EXPECT_TESTS` when you add a suite.**
+- **Sanitizer findings are fatal.** `-fno-sanitize-recover=all` means a UBSan
+  finding aborts the suite. Without it UBSan only prints `runtime error: …` and
+  the suite still exits 0, so undefined behaviour was reported as "0 failed".
+- **Per-test timeout.** Each suite gets `TEST_TIMEOUT` (300s) — long enough for
+  `test_ringbuf`'s two-thread 8 MB stress test under ASan. A timeout is counted
+  as a failure, so a deadlocked suite fails the run rather than hanging it.
 
 ## Credits
 

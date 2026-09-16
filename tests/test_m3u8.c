@@ -280,6 +280,130 @@ int main(void)
         CHECK("null_text_rejected", m3u8_parse(NULL, 0, "http://ex.test/p.m3u8", &m) == -1);
     }
 
+    /* ---- a dropped URI line still consumes its sequence number ------ */
+    {
+        /* b.ts has no EXTINF so it cannot be kept, but the server still
+         * numbered it: c.ts is segment 102, not 101. Getting this wrong gives
+         * every later segment the wrong default IV. */
+        static const char DROPSEQ[] =
+            "#EXTM3U\n#EXT-X-TARGETDURATION:6\n#EXT-X-MEDIA-SEQUENCE:100\n"
+            "#EXTINF:6,\na.ts\nb.ts\n#EXTINF:6,\nc.ts\n";
+        CHECK("dropseq_rc", parse(DROPSEQ, "http://ex.test/p.m3u8", &m) == 0);
+        CHECK("dropseq_segcount", m.segment_count == 2);
+        CHECK("dropseq_first", sg(&m, 0)->seq == 100);
+        CHECK("dropseq_gap_counted", sg(&m, 1)->seq == 102);
+        chk_str("dropseq_uri1", sg(&m, 1)->uri, "http://ex.test/c.ts");
+        CHECK("dropseq_iv_follows", iv_is_seq(sg(&m, 1)->iv, 102));
+        m3u8_free(&m);
+    }
+
+    /* ---- spaces around '=' in an attribute list --------------------- */
+    {
+        static const char KEYSPACE[] =
+            "#EXTM3U\n#EXT-X-TARGETDURATION:10\n#EXT-X-MEDIA-SEQUENCE:1\n"
+            "#EXT-X-KEY: METHOD = AES-128 , URI = \"k.bin\"\n"
+            "#EXTINF:10,\ns.ts\n";
+        CHECK("keyspace_rc", parse(KEYSPACE, "http://ex.test/hls/live.m3u8", &m) == 0);
+        CHECK("keyspace_encrypted", sg(&m, 0)->encrypted == 1);
+        chk_str("keyspace_key_uri", sg(&m, 0)->key_uri, "http://ex.test/hls/k.bin");
+        m3u8_free(&m);
+    }
+
+    /* ---- EXT-X-MEDIA-SEQUENCE out of range or negative -------------- */
+    {
+        static const char SEQHUGE[] =
+            "#EXTM3U\n#EXT-X-TARGETDURATION:6\n"
+            "#EXT-X-MEDIA-SEQUENCE:99999999999999999999999\n"
+            "#EXTINF:6,\na.ts\n#EXTINF:6,\nb.ts\n";
+        static const char SEQNEG[] =
+            "#EXTM3U\n#EXT-X-TARGETDURATION:6\n#EXT-X-MEDIA-SEQUENCE:-3\n"
+            "#EXTINF:6,\na.ts\n";
+        CHECK("seqhuge_rc", parse(SEQHUGE, "http://ex.test/p.m3u8", &m) == 0);
+        CHECK("seqhuge_ignored", m.media_sequence == 0);
+        CHECK("seqhuge_seq0", sg(&m, 0)->seq == 0);
+        CHECK("seqhuge_seq1", sg(&m, 1)->seq == 1);
+        m3u8_free(&m);
+        CHECK("seqneg_rc", parse(SEQNEG, "http://ex.test/p.m3u8", &m) == 0);
+        CHECK("seqneg_ignored", m.media_sequence == 0);
+        CHECK("seqneg_iv_not_negative", iv_is_seq(sg(&m, 0)->iv, 0));
+        m3u8_free(&m);
+    }
+
+    /* ---- a second EXT-X-MEDIA-SEQUENCE mid-playlist is ignored ------ */
+    {
+        /* RFC 8216 4.3.3.2: it must precede the first Media Segment. Honouring
+         * a later one makes sequence numbers go backwards inside one playlist. */
+        static const char SEQTWICE[] =
+            "#EXTM3U\n#EXT-X-TARGETDURATION:2\n#EXT-X-MEDIA-SEQUENCE:10\n"
+            "#EXTINF:2,\na.ts\n"
+            "#EXT-X-MEDIA-SEQUENCE:1\n"
+            "#EXTINF:2,\nb.ts\n";
+        CHECK("seqtwice_rc", parse(SEQTWICE, "http://ex.test/p.m3u8", &m) == 0);
+        CHECK("seqtwice_first_wins", m.media_sequence == 10);
+        CHECK("seqtwice_segcount", m.segment_count == 2);
+        CHECK("seqtwice_monotonic", sg(&m, 0)->seq == 10 && sg(&m, 1)->seq == 11);
+        m3u8_free(&m);
+    }
+
+    /* ---- an embedded NUL is a truncated response, not a short playlist */
+    {
+        static const char NULMID[] =
+            "#EXTM3U\n#EXT-X-TARGETDURATION:6\n#EXTINF:6,\na.ts\n"
+            "\0#EXTINF:6,\nb.ts\n";
+        CHECK("nulmid_rejected",
+              m3u8_parse(NULMID, sizeof(NULMID) - 1, "http://ex.test/p.m3u8", &m) == -1);
+        m3u8_free(&m);
+    }
+
+    /* ---- an over-long EXT-X-KEY URI is refused, not truncated ------- */
+    {
+        char longkey[2600];
+        char path[2100];
+        size_t i;
+
+        for (i = 0; i < sizeof(path) - 1; i++)
+            path[i] = 'k';
+        path[sizeof(path) - 1] = '\0';
+        snprintf(longkey, sizeof(longkey),
+                 "#EXTM3U\n#EXT-X-TARGETDURATION:6\n#EXT-X-MEDIA-SEQUENCE:1\n"
+                 "#EXT-X-KEY:METHOD=AES-128,URI=\"%s\"\n"
+                 "#EXTINF:6,\ns.ts\n", path);
+        CHECK("longkey_rc", parse(longkey, "http://ex.test/hls/live.m3u8", &m) == 0);
+        CHECK("longkey_encrypted", sg(&m, 0)->encrypted == 1);
+        CHECK("longkey_refused", sg(&m, 0)->key_uri == NULL);
+        m3u8_free(&m);
+    }
+
+    /* ---- an over-long IV is a malformed key, not a silent fallback -- */
+    {
+        static const char LONGIV[] =
+            "#EXTM3U\n#EXT-X-TARGETDURATION:6\n#EXT-X-MEDIA-SEQUENCE:7\n"
+            "#EXT-X-KEY:METHOD=AES-128,URI=\"k.bin\",IV=0x"
+            "0123456789ABCDEF0123456789ABCDEF0123456789ABCDEF"
+            "0123456789ABCDEF0123456789ABCDEF\n"
+            "#EXTINF:6,\ns.ts\n";
+        CHECK("longiv_rc", parse(LONGIV, "http://ex.test/hls/live.m3u8", &m) == 0);
+        CHECK("longiv_encrypted", sg(&m, 0)->encrypted == 1);
+        CHECK("longiv_refused", sg(&m, 0)->key_uri == NULL);
+        m3u8_free(&m);
+    }
+
+    /* ---- an unrecognised METHOD names itself ------------------------ */
+    {
+        /* RFC 8216 enumerated-strings are case-sensitive, so "aes-128" is
+         * correctly refused. The value has to reach the caller so the device
+         * can say which one it was instead of just "unsupported". */
+        static const char LOWERM[] =
+            "#EXTM3U\n#EXT-X-TARGETDURATION:6\n#EXT-X-MEDIA-SEQUENCE:1\n"
+            "#EXT-X-KEY:METHOD=aes-128,URI=\"k.bin\"\n"
+            "#EXTINF:6,\ns.ts\n";
+        CHECK("lowerm_rc", parse(LOWERM, "http://ex.test/hls/live.m3u8", &m) == 0);
+        CHECK("lowerm_encrypted", sg(&m, 0)->encrypted == 1);
+        CHECK("lowerm_no_key", sg(&m, 0)->key_uri == NULL);
+        chk_str("lowerm_method_named", sg(&m, 0)->key_method, "aes-128");
+        m3u8_free(&m);
+    }
+
     printf("test_m3u8: %d passed, %d failed\n", g_pass, g_fail);
     return g_fail ? 1 : 0;
 }

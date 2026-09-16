@@ -23,7 +23,15 @@ void   rb_free(RingBuf *rb);
 void   rb_reset(RingBuf *rb);                   /* empty it, clear closed + aborted */
 
 /* Blocks until all len bytes are stored. Returns 0, or -1 if aborted
- * (also -1 if closed). */
+ * (also -1 if closed).
+ *
+ * NOT all-or-nothing: a large write is committed in chunks as space frees up,
+ * so a -1 can leave an arbitrary prefix of src already in the buffer. That is
+ * deliberate rather than overlooked - rolling the prefix back would mean
+ * holding the whole write off until it fits, which deadlocks any src longer
+ * than cap. It is safe because every rb_abort path retires the buffer straight
+ * away, so no reader is left to consume the truncated prefix. A caller that
+ * reuses a buffer across an abort would have to account for it. */
 int    rb_write(RingBuf *rb, const unsigned char *src, size_t len);
 
 /* Waits up to timeout_ms (<0 = forever) for at least one byte.

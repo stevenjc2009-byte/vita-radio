@@ -298,6 +298,76 @@ int main(void)
         CHECK("null_text_fails", playlist_first_url(NULL, 0, base, out, sizeof(out)) == -1);
     }
 
+    /* ---- CR-only line endings ---------------------------------------- */
+    /* A classic-Mac file has no LF at all. Split on '\n' only and the whole
+     * file is one "line", so the first URL comes out with the rest of the
+     * playlist glued to it and a 0x0D in the middle. */
+    {
+        const char *m3u = "http://example.com/a.mp3\rhttp://example.com/b.mp3\r";
+        CHECK("m3u_cr_only", first_is(m3u, base, "http://example.com/a.mp3"));
+    }
+
+    {
+        const char *m3u = "#EXTM3U\r#EXTINF:-1,R\rhttp://example.com/cr.mp3\r";
+        CHECK("m3u_cr_only_comments_skipped", first_is(m3u, base, "http://example.com/cr.mp3"));
+    }
+
+    {
+        const char *pls =
+            "[playlist]\r"
+            "NumberOfEntries=2\r"
+            "File2=http://example.com/two\r"
+            "File1=http://example.com/one\r";
+        CHECK("pls_cr_only", first_is(pls, base, "http://example.com/one"));
+    }
+
+    {
+        /* CRLF must still count as one terminator, not two - an extra empty
+         * line between entries would be harmless here, but a CR left on the
+         * end of the value would not. */
+        CHECK("crlf_is_one_terminator",
+              first_is("http://example.com/x.mp3\r\n", base, "http://example.com/x.mp3"));
+    }
+
+    {
+        /* A lone trailing CR with nothing after it. */
+        CHECK("m3u_lone_trailing_cr",
+              first_is("http://example.com/y.mp3\r", base, "http://example.com/y.mp3"));
+    }
+
+    /* ---- control characters inside a value --------------------------- */
+    /* Swallowing one silently yields a different, plausible-looking host or
+     * path. Consistent with the file's own rule at the top: a wrong URL is
+     * worse than no URL. */
+    {
+        CHECK("pls_value_control_char_rejected",
+              first_fails("[playlist]\nFile1=http://example.com/a\x01" "b\n", base));
+        CHECK("pls_value_del_rejected",
+              first_fails("[playlist]\nFile1=http://example.com/a\x7f" "b\n", base));
+        CHECK("pls_value_inner_tab_rejected",
+              first_fails("[playlist]\nFile1=http://example.com/a\tb\n", base));
+    }
+
+    {
+        CHECK("m3u_control_char_rejected",
+              first_fails("http://example.com/a\x01" "b\n", base));
+        CHECK("m3u_del_rejected",
+              first_fails("http://example.com/a\x7f" "b\n", base));
+        /* Skipped like a comment, so a clean later line still wins. */
+        CHECK("m3u_bad_line_skipped",
+              first_is("http://example.com/a\x01" "b\nhttp://example.com/ok.mp3\n",
+                       base, "http://example.com/ok.mp3"));
+    }
+
+    {
+        /* A bad first entry does not poison a good later one. */
+        const char *pls =
+            "[playlist]\n"
+            "File1=http://example.com/a\x01" "b\n"
+            "File2=http://example.com/clean\n";
+        CHECK("pls_bad_entry_skipped", first_is(pls, base, "http://example.com/clean"));
+    }
+
     printf("test_playlist: %d passed, %d failed\n", g_pass, g_fail);
     return g_fail ? 1 : 0;
 }

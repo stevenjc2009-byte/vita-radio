@@ -29,17 +29,36 @@ static void trim(const char **s, const char **e)
 }
 
 /* Next line in [*p, end): its span lands in [*ls, *le) with the terminator
- * stripped, *p moves past it. Returns 0 at end of input. */
+ * stripped, *p moves past it. Returns 0 at end of input.
+ *
+ * All three conventions end a line here. Splitting on '\n' alone would read a
+ * classic-Mac CR-only playlist as a single line and hand the whole file out as
+ * one URL with 0x0D bytes buried in it. */
 static int next_line(const char **p, const char *end, const char **ls, const char **le)
 {
     if (*p >= end)
         return 0;
     *ls = *p;
-    while (*p < end && **p != '\n')
+    while (*p < end && **p != '\n' && **p != '\r')
         (*p)++;
     *le = *p;
-    if (*p < end)
+    if (*p < end) {
+        int cr = (**p == '\r');
         (*p)++;
+        if (cr && *p < end && **p == '\n')
+            (*p)++;                 /* CRLF is one terminator, not two */
+    }
+    return 1;
+}
+
+/* A URL with a control byte in it is not the URL the playlist named - the byte
+ * gets swallowed somewhere downstream and we dial a different, plausible host
+ * or path. Same stance as PL_MAX_URL above: better no URL than a wrong one. */
+static int span_is_clean(const char *s, const char *e)
+{
+    for (; s < e; s++)
+        if ((unsigned char)*s < 0x20 || (unsigned char)*s == 0x7F)
+            return 0;
     return 1;
 }
 
@@ -90,6 +109,8 @@ static long pls_file_entry(const char *s, const char *e, const char **vs, const 
     trim(vs, ve);
     if (*vs >= *ve)
         return -1;      /* "File1=" with nothing after it */
+    if (!span_is_clean(*vs, *ve))
+        return -1;      /* a control byte inside the value: not a usable URL */
     return num;
 }
 
@@ -146,6 +167,8 @@ int playlist_first_url(const char *text, size_t len, const char *base_url,
             trim(&ls, &le);
             if (ls == le || *ls == '#')
                 continue;
+            if (!span_is_clean(ls, le))
+                continue;           /* skipped like a comment, not fatal */
             best_s = ls;
             best_e = le;
             break;

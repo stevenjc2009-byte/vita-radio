@@ -18,7 +18,8 @@
 #define IME_MAX_TEXT  64
 #define IME_TITLE_MAX SCE_IME_DIALOG_MAX_TITLE_LENGTH
 
-/* The dialog composites over whatever is already in the back buffer. */
+/* The frame under the dialog is cleared first, so this dims the clear colour,
+ * not the app's UI - nothing of the station list shows through. */
 #define COL_DIM RGBA8(0, 0, 0, 170)
 
 /* The dialog writes into inputTextBuffer while it is up, so these outlive any
@@ -46,26 +47,35 @@ static void utf8_to_utf16(const char *src, SceWChar16 *dst, size_t dst_units)
     while (*s && o + 1 < dst_units) {
         unsigned char c = s[0];
         uint32_t cp;
+        size_t seq;
 
         if (c < 0x80) {
             cp = c;
-            s += 1;
+            seq = 1;
         } else if ((c & 0xE0) == 0xC0 && (s[1] & 0xC0) == 0x80) {
             cp = ((uint32_t)(c & 0x1F) << 6) | (uint32_t)(s[1] & 0x3F);
-            s += 2;
+            seq = 2;
         } else if ((c & 0xF0) == 0xE0 && (s[1] & 0xC0) == 0x80 && (s[2] & 0xC0) == 0x80) {
             cp = ((uint32_t)(c & 0x0F) << 12) | ((uint32_t)(s[1] & 0x3F) << 6) |
                  (uint32_t)(s[2] & 0x3F);
-            s += 3;
+            seq = 3;
         } else if ((c & 0xF8) == 0xF0 && (s[1] & 0xC0) == 0x80 && (s[2] & 0xC0) == 0x80 &&
                    (s[3] & 0xC0) == 0x80) {
             cp = ((uint32_t)(c & 0x07) << 18) | ((uint32_t)(s[1] & 0x3F) << 12) |
                  ((uint32_t)(s[2] & 0x3F) << 6) | (uint32_t)(s[3] & 0x3F);
-            s += 4;
+            seq = 4;
         } else {
             s += 1;     /* malformed lead or truncated sequence */
             continue;
         }
+        s += seq;
+
+        /* Overlong forms encode a code point a shorter sequence already covers.
+         * Accepting them lets "C0 80" through as a NUL, which truncates the
+         * string, and "E0 80 AF" through as '/'. */
+        if ((seq == 2 && cp < 0x80) || (seq == 3 && cp < 0x800) ||
+            (seq == 4 && cp < 0x10000)) continue;
+        if (cp == 0) break;     /* embedded NUL ends the string */
 
         /* Lone surrogates and out-of-range code points are not representable. */
         if (cp > 0x10FFFF || (cp >= 0xD800 && cp <= 0xDFFF)) continue;
@@ -201,8 +211,7 @@ int ime_prompt(const char *title, const char *initial, char *out, size_t outsz)
         vita2d_draw_rectangle(0, 0, SCREEN_W, SCREEN_H, COL_DIM);
         vita2d_end_drawing();
         vita2d_common_dialog_update();
-        vita2d_swap_buffers();
-        sceDisplayWaitVblankStart();
+        vita2d_swap_buffers();   /* already waits for vblank */
 
         status = sceImeDialogGetStatus();
         if (status == SCE_COMMON_DIALOG_STATUS_FINISHED) break;
@@ -225,4 +234,21 @@ int ime_prompt(const char *title, const char *initial, char *out, size_t outsz)
 
     utf16_to_utf8(s_input, out, outsz);
     return 1;
+}
+
+void ime_shutdown(void)
+{
+    /* Not guarded on s_ready: ime_init() can fail with SceAppUtil already up,
+     * and that is exactly the case this has to clean up. */
+    if (s_busy) {
+        sceImeDialogTerm();
+        s_busy = 0;
+    }
+    /* sceAppUtilInit starts a service thread and an app-event channel to
+     * SceShell. Left running, they keep the process alive after
+     * sceKernelExitProcess() - the app stops drawing but never dies and
+     * LiveArea does not come back. */
+    sceAppUtilShutdown();
+    sceSysmoduleUnloadModule(SCE_SYSMODULE_IME);
+    s_ready = 0;
 }

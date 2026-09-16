@@ -292,6 +292,28 @@ int main(void)
         CHECK("extract_ignores_after_nul", icy_extract_title(m, sizeof(m), out, sizeof(out)) == 0);
     }
 
+    /* Truncation must land on a character boundary: half a UTF-8 sequence is
+     * not text the renderer can draw. "abcd" + U+20AC (E2 82 AC) in 7 bytes. */
+    {
+        const char *m = "StreamTitle='abcd\xE2\x82\xAC';";
+        char o[8];
+        CHECK("extract_utf8_boundary",
+              icy_extract_title(m, strlen(m), o, 7) == 1 && strcmp(o, "abcd") == 0);
+        CHECK("extract_utf8_exact_fit",
+              icy_extract_title(m, strlen(m), o, 8) == 1 &&
+              strcmp(o, "abcd\xE2\x82\xAC") == 0);
+    }
+    /* A two-byte sequence, and a cut that already lands on a boundary. */
+    {
+        const char *m = "StreamTitle='ab\xC3\xA9xy';";
+        char o[8];
+        CHECK("extract_utf8_two_byte",
+              icy_extract_title(m, strlen(m), o, 4) == 1 && strcmp(o, "ab") == 0);
+        CHECK("extract_utf8_clean_cut",
+              icy_extract_title(m, strlen(m), o, 5) == 1 &&
+              strcmp(o, "ab\xC3\xA9") == 0);
+    }
+
     printf("test_icy: %d passed, %d failed\n", g_pass, g_fail);
     return g_fail ? 1 : 0;
 }

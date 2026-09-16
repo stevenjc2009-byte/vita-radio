@@ -82,6 +82,13 @@ static int sec_push(Section *s, const unsigned char *p, size_t n)
     memcpy(s->buf + s->have, p, n);
     s->have += n;
     total = sec_total(s);
+    if (total > SEC_MAX) {
+        /* section_length is 12 bits but the buffer holds 1021 payload bytes,
+         * so this one can never complete. Drop it now instead of leaving the
+         * buffer full until the next pointer_field happens to clear it. */
+        sec_reset(s);
+        return 0;
+    }
     return total != 0 && s->have >= total;
 }
 
@@ -105,9 +112,12 @@ static void parse_pat(TsDemux *t, const unsigned char *s, size_t total)
 
 static int is_audio_type(int st)
 {
+    /* 0x11 (LATM AAC) is deliberately absent: decoder.c only ever asks for
+     * AV_CODEC_ID_AAC, so LATM bytes reach an ADTS parser that never finds a
+     * sync word - a silent stream with no error and no timeout. Falling
+     * through to the next elementary stream is the honest failure. */
     return st == 0x03 || st == 0x04        /* MPEG-1 / MPEG-2 audio */
-        || st == 0x0F                      /* ADTS AAC */
-        || st == 0x11;                     /* LATM AAC */
+        || st == 0x0F;                     /* ADTS AAC */
 }
 
 static void parse_pmt(TsDemux *t, const unsigned char *s, size_t total)
@@ -260,8 +270,23 @@ static int process_pkt(TsDemux *t, const unsigned char *p, TsEsFn fn, void *user
     if (prev >= 0) {
         if (cc == prev)
             return 0;                       /* legal duplicate packet */
-        if (cc != ((prev + 1) & 0x0F))
-            t->cc_errors++;
+        if (cc != ((prev + 1) & 0x0F)) {
+            /* The two sides of the gap do not join. Splicing them hands the
+             * decoder a frame with its middle missing, and a PSI section
+             * reassembled across the gap can name the wrong audio PID. Wait
+             * for the next PUSI instead. A discontinuity the sender signalled
+             * is a deliberate break, not lost packets, so it is not counted. */
+            int signalled = (afc & 2) && p[4] != 0 && (p[5] & 0x80) != 0;
+            if (!signalled)
+                t->cc_errors++;
+            t->pes_state = PES_IDLE;
+            t->pes_hdr_have = 0;
+            t->pes_skip = 0;
+            if (pid == 0x0000)
+                sec_reset(&t->pat);
+            else if (pid == t->pmt_pid)
+                sec_reset(&t->pmt);
+        }
     }
     t->cc[pid] = (signed char)cc;
 
@@ -339,6 +364,12 @@ int ts_demux_feed(TsDemux *t, const unsigned char *data, size_t len,
     if (!t || (!data && len))
         return -1;
 
+    /* RESYNC_MAX is this call's budget, not the object's. It used to be
+     * cumulative, so one segment that was not TS at all - an HTML error page,
+     * an fMP4 chunk - spent the budget for good and every later segment
+     * returned -1 as well, silently killing the station for the session. */
+    t->junk = 0;
+
     /* The second clause drains a packet already buffered by the resync path,
      * so a feed that ends on a packet boundary emits it without waiting. */
     while (i < len || (t->synced && t->have == TS_PKT)) {
@@ -350,8 +381,10 @@ int ts_demux_feed(TsDemux *t, const unsigned char *data, size_t len,
                 i++;
                 t->junk++;
             }
-            if (t->junk > RESYNC_MAX)
+            if (t->junk > RESYNC_MAX) {
+                ts_demux_reset(t);          /* leave the object usable */
                 return -1;
+            }
             if (i == len)
                 break;
         }
@@ -377,8 +410,10 @@ int ts_demux_feed(TsDemux *t, const unsigned char *data, size_t len,
                     return 1;
             } else {
                 shift_to_next_sync(t);
-                if (t->junk > RESYNC_MAX)
+                if (t->junk > RESYNC_MAX) {
+                    ts_demux_reset(t);      /* leave the object usable */
                     return -1;
+                }
             }
         } else if (t->buf[0] != 0x47) {
             t->synced = 0;                  /* lost alignment mid-stream */

@@ -35,6 +35,22 @@ static char *dup_str(const char *s)
     return d;
 }
 
+/* Case-insensitive "https://" test - the scheme's case is not significant, and
+ * the NUL stops the comparison before a short string can be overrun. */
+static int is_https_url(const char *u)
+{
+    static const char pfx[] = "https://";
+    size_t i;
+    for (i = 0; i < sizeof(pfx) - 1; i++) {
+        int c = (unsigned char)u[i];
+        if (c >= 'A' && c <= 'Z')
+            c += 'a' - 'A';
+        if (c != pfx[i])
+            return 0;
+    }
+    return 1;
+}
+
 static void set_err(char *err, size_t errsz, const char *fmt, ...)
 {
     va_list ap;
@@ -129,9 +145,17 @@ int http_get(const char *url, const char *user_agent, const char *ca_file,
         set_err(err, errsz, "no url");
         return -1;
     }
+    /* Curl's compile-time CA path does not exist on the Vita, so a missing
+     * bundle is a configuration fault. Name it, or it reads as a network fault. */
+    if (!ca_file) {
+        set_err(err, errsz, "no CA bundle configured");
+        return -1;
+    }
 
     memset(&body, 0, sizeof(body));
-    body.max = max_bytes ? max_bytes : VR_HTTP_GET_MAX;
+    /* A caller must be able to ask for less than the cap, never for more. */
+    body.max = (max_bytes && max_bytes < VR_HTTP_GET_MAX) ? max_bytes
+                                                          : VR_HTTP_GET_MAX;
 
     /* One handle per call, created and destroyed here: http_get is called from
      * the HLS worker thread and from the UI thread, so it has to be re-entrant. */
@@ -146,6 +170,10 @@ int http_get(const char *url, const char *user_agent, const char *ca_file,
     if (user_agent)
         curl_easy_setopt(c, CURLOPT_USERAGENT, user_agent);
     curl_easy_setopt(c, CURLOPT_FOLLOWLOCATION, 1L);
+    /* Follow redirects, but never let an https fetch be walked down to
+     * plaintext http by a Location header. */
+    curl_easy_setopt(c, CURLOPT_REDIR_PROTOCOLS_STR,
+                     is_https_url(url) ? "https" : "http,https");
     curl_easy_setopt(c, CURLOPT_MAXREDIRS, 8L);
     curl_easy_setopt(c, CURLOPT_CONNECTTIMEOUT, GET_CONNECT_TIMEOUT);
     curl_easy_setopt(c, CURLOPT_TIMEOUT, GET_TOTAL_TIMEOUT);

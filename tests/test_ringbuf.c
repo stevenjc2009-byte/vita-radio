@@ -9,8 +9,14 @@
 #include <unistd.h>
 
 static int g_failures;
+static int g_checks;
 
+/* g_checks counts every assertion, passing or not, so the final line can use
+   the same "N passed, M failed" wording as the other suites. Without it this
+   file printed only "ALL PASS" and the aggregate check count silently
+   excluded the one module where the concurrency bugs live. */
 #define CHECK(cond) do { \
+    g_checks++; \
     if (!(cond)) { printf("  CHECK FAILED %s:%d: %s\n", __FILE__, __LINE__, #cond); g_failures++; } \
 } while (0)
 
@@ -79,6 +85,54 @@ static void test_timeout(void)
     rb_free(&rb);
     printf("  timeout waited %ld ms for an 80 ms timeout\n", dt);
     report("timeout returns 0", before);
+}
+
+typedef struct {
+    RingBuf *rb;
+    int      delay_ms;
+} LateArg;
+
+static void *late_writer(void *p)
+{
+    LateArg *a = p;
+    unsigned char b[4] = {9, 8, 7, 6};
+    usleep((useconds_t)a->delay_ms * 1000);
+    rb_write(a->rb, b, sizeof(b));
+    return NULL;
+}
+
+/* rb_read re-arms its wait from a monotonic reference rather than trusting the
+ * wall-clock deadline it has to hand pthread_cond_timedwait. A clock step
+ * cannot be staged from a test without root, so what is checked here is the
+ * part that can be: the re-arm must not return a timeout early (the caller's
+ * r == 0 path has no sleep, so that would spin a core) and must not swallow a
+ * wakeup that arrives mid-wait. */
+static void test_timeout_is_not_early(void)
+{
+    int before = g_failures;
+    RingBuf rb;
+    CHECK(rb_init(&rb, 64) == 0);
+    unsigned char out[8];
+
+    long t0 = now_ms();
+    for (int i = 0; i < 4; i++)
+        CHECK(rb_read(&rb, out, sizeof(out), 150) == 0);
+    long dt = now_ms() - t0;
+    CHECK(dt >= 560 && dt < 1500);
+
+    LateArg la = {&rb, 100};
+    pthread_t tl;
+    pthread_create(&tl, NULL, late_writer, &la);
+    long t1 = now_ms();
+    long r = rb_read(&rb, out, sizeof(out), 1000);
+    long dw = now_ms() - t1;
+    pthread_join(tl, NULL);
+    CHECK(r == 4);
+    CHECK(dw >= 80 && dw < 500);
+
+    rb_free(&rb);
+    printf("  4 x 150 ms timeouts took %ld ms; a late write woke a 1000 ms read in %ld ms\n", dt, dw);
+    report("timed reads never return early, and still wake on a late write", before);
 }
 
 static void test_close(void)
@@ -257,13 +311,10 @@ int main(void)
 {
     test_wraparound_and_partial();
     test_timeout();
+    test_timeout_is_not_early();
     test_close();
     test_abort();
     test_stress();
-    if (g_failures) {
-        printf("test_ringbuf: FAIL (%d checks failed)\n", g_failures);
-        return 1;
-    }
-    printf("test_ringbuf: ALL PASS\n");
-    return 0;
+    printf("test_ringbuf: %d passed, %d failed\n", g_checks - g_failures, g_failures);
+    return g_failures ? 1 : 0;
 }

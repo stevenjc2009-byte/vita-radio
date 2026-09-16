@@ -19,4 +19,9 @@ int ime_init(void);
  * Returns 1 if the user confirmed, 0 if cancelled, -1 on error. */
 int ime_prompt(const char *title, const char *initial, char *out, size_t outsz);
 
+/* Undoes ime_init(). Must run before ui_shutdown(): the dialog composites
+ * through GXM, which vita2d_fini() tears down. Safe to call more than once,
+ * and safe after a failed ime_init(). */
+void ime_shutdown(void);
+
 #endif

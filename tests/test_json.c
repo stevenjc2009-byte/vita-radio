@@ -223,10 +223,21 @@ static void test_escapes(void)
     CHECK("esc_raw_utf8_passthrough", v && STR_IS(v, "caf\xC3\xA9"));
     json_free(v);
 
-    /* A NUL from \u0000 lands in the buffer; the C string simply ends there. */
+    /* A\u0000 escape becomes U+FFFD, never a real NUL byte:
+     * json_string() hands back a bare char* with no length, so a NUL in the
+     * middle silently truncates every consumer - a station URL included. Same
+     * treatment as an unpaired surrogate, and the same 6-in/3-out size. */
     v = pj("\"a\\u0000b\"");
-    CHECK("esc_u_nul", v && json_type(v) == JSON_STRING &&
-                       strcmp(json_string(v, ""), "a") == 0);
+    CHECK("esc_u_nul", v && STR_IS(v, "a\xEF\xBF\xBD" "b"));
+    json_free(v);
+
+    /* At the very start of a span, and as the whole span. */
+    v = pj("\"\\u0000\"");
+    CHECK("esc_u_nul_alone", v && STR_IS(v, "\xEF\xBF\xBD"));
+    json_free(v);
+
+    v = pj("\"x\\u0000\"");
+    CHECK("esc_u_nul_at_end", v && STR_IS(v, "x\xEF\xBF\xBD"));
     json_free(v);
 
     CHECK("esc_reject_unknown", rejects("\"\\q\""));

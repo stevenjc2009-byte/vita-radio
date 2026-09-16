@@ -5,10 +5,12 @@
 #include "fs_util.h"
 #include "zip_extract.h"
 
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
+#include <zlib.h>
 
 static int passed, failed;
 
@@ -71,6 +73,163 @@ static int b_bin_ok(const char *path)
     }
     fclose(f);
     return ok && i == 200000;
+}
+
+/* ---- hand-built archives ---------------------------------------------------
+ * The Python fixtures can only describe archives Python is willing to write.
+ * These tests need ones it isn't: a lying uncompressed size, a name longer than
+ * the old 255-byte limit, a deflated entry with no compressed bytes at all.
+ * Every recorded field is therefore set explicitly by the caller. */
+
+typedef struct {
+    const char *name;
+    const void *data;      /* the entry payload, stored verbatim */
+    uint32_t    len;       /* bytes of payload actually written */
+    uint16_t    method;    /* 0 stored, 8 deflate */
+    uint32_t    crc;       /* CRC-32 recorded in both headers */
+    uint32_t    csize;     /* compressed size recorded in both headers */
+    uint32_t    usize;     /* uncompressed size recorded in both headers */
+} ZipEnt;
+
+static void put16(uint8_t *p, unsigned v)
+{
+    p[0] = (uint8_t)(v & 0xFF);
+    p[1] = (uint8_t)((v >> 8) & 0xFF);
+}
+
+static void put32(uint8_t *p, uint32_t v)
+{
+    p[0] = (uint8_t)(v & 0xFF);
+    p[1] = (uint8_t)((v >> 8) & 0xFF);
+    p[2] = (uint8_t)((v >> 16) & 0xFF);
+    p[3] = (uint8_t)((v >> 24) & 0xFF);
+}
+
+/* Writes a one-entry archive. Returns 0 on success. */
+static int write_zip(const char *path, const ZipEnt *e)
+{
+    uint8_t lh[30] = {0}, ch[46] = {0}, eocd[22] = {0};
+    size_t nlen = strlen(e->name);
+    FILE *f = fopen(path, "wb");
+    if (!f)
+        return -1;
+
+    put32(lh, 0x04034b50u);
+    put16(lh + 4, 20);
+    put16(lh + 8, e->method);
+    put32(lh + 14, e->crc);
+    put32(lh + 18, e->csize);
+    put32(lh + 22, e->usize);
+    put16(lh + 26, (unsigned)nlen);
+    fwrite(lh, 1, sizeof(lh), f);
+    fwrite(e->name, 1, nlen, f);
+    if (e->len)
+        fwrite(e->data, 1, e->len, f);
+
+    long cd_off = ftell(f);
+    put32(ch, 0x02014b50u);
+    put16(ch + 4, 20);
+    put16(ch + 6, 20);
+    put16(ch + 10, e->method);
+    put32(ch + 16, e->crc);
+    put32(ch + 20, e->csize);
+    put32(ch + 24, e->usize);
+    put16(ch + 28, (unsigned)nlen);
+    put32(ch + 42, 0);                  /* local header offset */
+    fwrite(ch, 1, sizeof(ch), f);
+    fwrite(e->name, 1, nlen, f);
+
+    long cd_end = ftell(f);
+    put32(eocd, 0x06054b50u);
+    put16(eocd + 8, 1);
+    put16(eocd + 10, 1);
+    put32(eocd + 12, (uint32_t)(cd_end - cd_off));
+    put32(eocd + 16, (uint32_t)cd_off);
+    fwrite(eocd, 1, sizeof(eocd), f);
+    return fclose(f) == 0 ? 0 : -1;
+}
+
+/* Fills in the honest crc/csize/usize for a stored entry. */
+static ZipEnt stored(const char *name, const void *data, uint32_t len)
+{
+    ZipEnt e = {name, data, len, 0, 0, len, len};
+    e.crc = (uint32_t)crc32(crc32(0L, Z_NULL, 0), (const Bytef *)data, (uInt)len);
+    return e;
+}
+
+/* "aaa.../aaa.../file" - `parts` components of 99 bytes, 100n-1 bytes overall. */
+static void make_name(char *out, size_t outsz, int parts)
+{
+    size_t n = 0;
+    for (int i = 0; i < parts; i++) {
+        if (i)
+            out[n++] = '/';
+        memset(out + n, 'a' + i, 99);
+        n += 99;
+    }
+    if (n < outsz)
+        out[n] = '\0';
+}
+
+static void test_crafted(const char *root)
+{
+    char zip[512], dir[512], path[1400], name[700];
+    static const char BODY[] = "payload";
+    ZipEnt e;
+    int r;
+
+    snprintf(zip, sizeof(zip), "%s/crafted.zip", root);
+
+    /* A deflated entry that is genuinely empty has no stream to inflate. */
+    e = stored("empty.txt", "", 0);
+    e.method = 8;
+    CHECK(write_zip(zip, &e) == 0, "write empty deflate zip");
+    snprintf(dir, sizeof(dir), "%s/empty", root);
+    r = zip_extract(zip, dir, NULL, NULL);
+    CHECK(r == ZIP_OK, "empty deflated entry: %d %s", r, zip_strerror(r));
+    snprintf(path, sizeof(path), "%s/empty.txt", dir);
+    CHECK(exists(path), "empty.txt not created");
+
+    /* A 299-byte name is legal (the spec allows 65535) and fits FS_PATH_LEN.
+     * Split into components, because 255 bytes is the per-component limit of
+     * every filesystem involved - it is the whole name that used to be
+     * rejected, and only for being over 255. */
+    make_name(name, sizeof(name), 3);
+    CHECK(strlen(name) == 299, "long name is %zu bytes", strlen(name));
+    e = stored(name, BODY, (uint32_t)strlen(BODY));
+    CHECK(write_zip(zip, &e) == 0, "write long-name zip");
+    snprintf(dir, sizeof(dir), "%s/longname", root);
+    r = zip_extract(zip, dir, NULL, NULL);
+    CHECK(r == ZIP_OK, "299-byte name: %d %s", r, zip_strerror(r));
+    snprintf(path, sizeof(path), "%s/%s", dir, name);
+    CHECK(file_equals(path, BODY), "long-name entry content");
+
+    /* Longer than the target path can hold: refused, but as "unsupported". */
+    make_name(name, sizeof(name), 6);
+    e = stored(name, BODY, (uint32_t)strlen(BODY));
+    CHECK(write_zip(zip, &e) == 0, "write over-long-name zip");
+    snprintf(dir, sizeof(dir), "%s/toolong", root);
+    r = zip_extract(zip, dir, NULL, NULL);
+    CHECK(r == ZIP_ERR_UNSUPPORTED, "599-byte name: %d %s", r, zip_strerror(r));
+
+    /* A zip bomb: 200 MB declared uncompressed, refused before anything is
+     * written. usize alone is overridden, so the old code got as far as
+     * creating (and truncating) the output file. */
+    e = stored("bomb.bin", BODY, (uint32_t)strlen(BODY));
+    e.usize = 200u * 1024 * 1024;
+    CHECK(write_zip(zip, &e) == 0, "write bomb zip");
+    snprintf(dir, sizeof(dir), "%s/bomb", root);
+    r = zip_extract(zip, dir, NULL, NULL);
+    CHECK(r == ZIP_ERR_TOO_BIG, "declared 200 MB: %d %s", r, zip_strerror(r));
+    snprintf(path, sizeof(path), "%s/bomb.bin", dir);
+    CHECK(!exists(path), "bomb.bin was created before the size was checked");
+
+    /* Just under the cap still extracts (the cap must not reject real VPKs). */
+    e = stored("ok.bin", BODY, (uint32_t)strlen(BODY));
+    CHECK(write_zip(zip, &e) == 0, "write ok zip");
+    snprintf(dir, sizeof(dir), "%s/undercap", root);
+    r = zip_extract(zip, dir, NULL, NULL);
+    CHECK(r == ZIP_OK, "small archive rejected by the cap: %d %s", r, zip_strerror(r));
 }
 
 int main(int argc, char **argv)
@@ -137,6 +296,8 @@ int main(int argc, char **argv)
     CHECK(!zip_name_safe("a/../b"), "inner ..");
     CHECK(!zip_name_safe("a\\..\\b"), "backslash ..");
     CHECK(!zip_name_safe(""), "empty");
+
+    test_crafted(root);
 
     fs_rm_tree(root);
     CHECK(!exists(root), "rm_tree left %s", root);

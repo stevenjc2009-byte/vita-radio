@@ -14,7 +14,9 @@ typedef struct HttpStream HttpStream;
 typedef struct {
     const char *url;
     const char *user_agent;   /* e.g. "VitaRadio/0.1" */
-    const char *ca_file;      /* e.g. "app0:assets/cacert.pem"; NULL = curl default */
+    const char *ca_file;      /* e.g. "app0:assets/cacert.pem". NULL is a
+                               * configuration error, not "use curl's default":
+                               * that path does not exist on the Vita. */
     RingBuf    *out;
     /* Called once from the worker, after response headers and before the first
      * audio byte. content_type may be NULL. */
@@ -32,8 +34,11 @@ void        http_stream_stop(HttpStream *s);
 
 int         http_stream_finished(HttpStream *s);   /* 1 once the worker exited */
 
-/* Valid after finished. Returns 0 for a clean end, else the CURLcode, or an
- * HTTP status >= 400. A readable message goes to err. */
+/* Valid after finished. Returns 0 for a clean end - at least one audio byte,
+ * then the stream ended or was stopped - else the CURLcode, or a non-2xx HTTP
+ * status, or -1 for a fault with no HTTP code of its own: no CA bundle, no
+ * response at all, or a 2xx that carried no audio. A readable message goes to
+ * err - on a clean end it may still carry a non-fatal notice. */
 int         http_stream_result(HttpStream *s, char *err, size_t errsz);
 
 #endif

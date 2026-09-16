@@ -12,6 +12,12 @@
 #define ADTS_LOOK  10u       /* enough to test an ADTS header (7) or an ID3 one (10) */
 #define SCAN_CAP   (ADTS_MAX + ADTS_LOOK + 8)
 
+/* A syncsafe size field can declare 256 MB. HLS timed-metadata tags are a few
+ * hundred bytes and even a cover-art tag stays well under a megabyte, so a
+ * larger claim is a corrupt header rather than a tag: believing it would drop
+ * minutes of audio with no re-validation and no way back. */
+#define ID3_MAX    (1u << 20)
+
 struct AdtsScan {
     unsigned char buf[SCAN_CAP];
     size_t        n;          /* bytes carried over / staged in buf */
@@ -40,7 +46,10 @@ static size_t adts_len(const unsigned char *p, size_t avail)
     if (chan == 0 || chan > 7)      /* 0 means an in-band PCE: not a radio feed */
         return 0;
     fl = ((size_t)(p[3] & 3) << 11) | ((size_t)p[4] << 3) | ((size_t)p[5] >> 5);
-    return fl >= ADTS_HDR ? fl : 0;
+    /* frame_length counts the header, which is 7 bytes or 9 with the CRC, so
+     * a frame that declares exactly that carries no payload at all: there is
+     * nothing in it for the decoder. */
+    return fl > (size_t)((p[1] & 1) ? 7 : 9) ? fl : 0;
 }
 
 /* Returns the total ID3v2 tag length at p (may exceed avail), or 0 if that is
@@ -58,7 +67,7 @@ static size_t id3_len(const unsigned char *p, size_t avail)
     size += 10;
     if (p[5] & 0x10)
         size += 10;   /* footer present */
-    return size;
+    return size > ID3_MAX ? 0 : size;
 }
 
 /* True if the avail (< 10) bytes at p are still consistent with "ID3". */
@@ -193,6 +202,10 @@ int adts_scan_feed(AdtsScan *a, const unsigned char *data, size_t len,
             a->skip_left -= k;
             if (a->skip_left != 0)
                 return 0;                   /* whole feed swallowed by the tag */
+            /* The tag length was only its own claim. Where it says the audio
+             * resumes, a lone 0xFFF is not proof of a frame, so re-acquire
+             * sync rather than trust whatever byte the skip landed on. */
+            a->locked = 0;
         }
 
         if (pos < len && a->n < SCAN_CAP) {
