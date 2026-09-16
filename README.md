@@ -1,12 +1,22 @@
 # Vita Radio
 
-An internet radio player for the PlayStation Vita. Browse a built-in list of
-stations, press X, and it streams — MP3 and AAC over HTTP and HTTPS, with the
-ICY track title shown while it plays. Written in C with VitaSDK and vita2d.
+An internet radio player for the PlayStation Vita. Browse 90 built-in stations
+or search for your own, press X, and it streams — MP3, AAC and HLS over HTTP
+and HTTPS, with the ICY track title shown while it plays. Written in C with
+VitaSDK and vita2d.
 
 ## Features
 
-- **Built-in station list** with the codec and stream type shown per station.
+- **90 built-in stations**, including 30 BBC networks, grouped by region and
+  genre, with the codec and stream type shown per station.
+- **HLS** as well as plain MP3 and AAC: master and media playlists, MPEG-TS and
+  raw ADTS segments, and AES-128 encrypted segments.
+- **Playlist links work** — point it at a `.pls` or `.m3u` and it follows the
+  link to the actual stream.
+- **Search** the radio-browser.info directory from the console (SQUARE) using
+  the Vita's on-screen keyboard.
+- **Favourites** (SELECT), saved between sessions and starred wherever the
+  station appears. L/R cycles Built-in, Favourites and Search.
 - **Live stream info:** state, ICY track title, codec, sample rate, channels,
   HTTP status, buffer fill and bytes received.
 - **HTTPS streams** with certificate verification against a bundled CA store.
@@ -17,10 +27,10 @@ ICY track title shown while it plays. Written in C with VitaSDK and vita2d.
 
 ## Install
 
-<img src="docs/install-qr.png" alt="QR code for the VitaRadio.vpk 1.0.0 download" width="200" align="right">
+<img src="docs/install-qr.png" alt="QR code for the VitaRadio.vpk 2.0.0 download" width="200" align="right">
 
 Scan the code with the Vita's own browser (**Browser → ☰ → QR code reader**) and
-it downloads `VitaRadio.vpk` for 1.0.0 straight to the console — no PC, no USB.
+it downloads `VitaRadio.vpk` for 2.0.0 straight to the console — no PC, no USB.
 Then install the downloaded file with VitaShell.
 
 Or do it by hand:
@@ -39,8 +49,11 @@ From 1.0.0 onwards you only have to do this once: later versions arrive through
 | Button | Action |
 | --- | --- |
 | Up / Down | Move through the station list (hold to repeat) |
+| L / R | Switch list: Built-in, Favourites, Search |
 | X | Play the selected station |
 | O | Stop playback |
+| SQUARE | Search for stations (opens the on-screen keyboard) |
+| SELECT | Add or remove the selected station from Favourites |
 | TRIANGLE | Check for updates; press again to install one |
 | START | Quit |
 
@@ -52,9 +65,12 @@ make                      # -> build/VitaRadio.vpk
 make BUILD=build-verify   # build into a separate directory
 ```
 
-Host unit tests for the pure-C modules (ring buffer, ICY parser, format
-sniffer, player lifecycle, version/JSON parsing, SHA-1 + head.bin, zip
-extractor) run outside the SDK:
+17 host unit test suites cover the pure-C modules — ring buffer, ICY parser,
+format sniffer, player lifecycle, `.pls`/`.m3u` playlists, URL resolution, the
+HLS stack (M3U8 parser, MPEG-TS demuxer, ADTS scanner, AES-128 and key
+handling), the station list and favourites, version/JSON parsing, SHA-1 +
+head.bin and the zip extractor. They build outside the SDK, under ASan and
+UBSan:
 
 ```bash
 make -C tests

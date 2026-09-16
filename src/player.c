@@ -12,7 +12,9 @@
 
 #include "audio_out.h"
 #include "decoder.h"
+#include "hls.h"
 #include "http_stream.h"
+#include "playlist.h"
 #include "ringbuf.h"
 #include "sniff.h"
 
@@ -26,25 +28,31 @@
 #define THREAD_STACK     (256 * 1024)
 #define REAPER_STACK     (32 * 1024)
 #define SHUTDOWN_WAIT_MS 20000   /* > curl's 15 s connect timeout */
+#define MAX_SOURCE_HOPS  2       /* .pls -> .m3u8 -> media is the deepest real case */
 
 /* One connection: its own ring buffer, so an abandoned connection that is
  * still stuck in DNS/connect can be reaped in the background while the next
  * station starts on a fresh buffer. */
 typedef struct {
     RingBuf     rb;
-    HttpStream *http;
+    HttpStream *http;   /* exactly one of these two is set */
+    HlsStream  *hls;
 } Conn;
 
 static pthread_mutex_t g_lock = PTHREAD_MUTEX_INITIALIZER;       /* guards g_st, g_gen */
-static pthread_mutex_t g_http_lock = PTHREAD_MUTEX_INITIALIZER;  /* guards g_http use */
+/* Guards the live source handles AND g_conn: the decode thread swaps the source
+ * in place (switch_source) while the UI thread may be stopping, and the two must
+ * not interleave. */
+static pthread_mutex_t g_http_lock = PTHREAD_MUTEX_INITIALIZER;
 static PlayerStatus    g_st;
-static unsigned        g_gen;             /* bumped on every stop; stale callbacks are ignored */
+static unsigned        g_gen;             /* bumped on every stop AND source swap; stale callbacks ignored */
 static int             g_inited;
-static Conn           *g_conn;            /* current connection (UI thread only) */
+static Conn           *g_conn;            /* current connection (under g_http_lock) */
 static RingBuf        *g_rb;              /* &g_conn->rb, read by the decode thread */
 static atomic_int      g_reapers;         /* background stops still running */
 static AudioOut       *g_audio;
 static HttpStream     *g_http;
+static HlsStream      *g_hls;             /* set instead of g_http for an HLS source */
 static pthread_t       g_thread;
 static int             g_thread_running;
 static Decoder        *g_dec;             /* owned by the decode thread until joined */
@@ -52,6 +60,8 @@ static atomic_int      g_stop;
 static char            g_ua[128];
 static char            g_ca[256];
 static int             g_have_ca;
+
+static void conn_release(Conn *c);
 
 /* ---- helpers ---------------------------------------------------------- */
 
@@ -89,13 +99,16 @@ static void set_state(PlayerState s)
     pthread_mutex_unlock(&g_lock);
 }
 
-/* http_stream_finished on the live handle; treats a stopped/cleared handle as finished. */
+/* "Is the live source done?" over whichever kind is attached; treats a
+ * stopped/cleared handle as finished. */
 static int stream_finished(void)
 {
     int fin = 1;
     pthread_mutex_lock(&g_http_lock);
-    if (g_http && !atomic_load(&g_stop))
-        fin = http_stream_finished(g_http);
+    if (!atomic_load(&g_stop)) {
+        if (g_http)      fin = http_stream_finished(g_http);
+        else if (g_hls)  fin = hls_stream_finished(g_hls);
+    }
     pthread_mutex_unlock(&g_http_lock);
     return fin;
 }
@@ -105,8 +118,10 @@ static int stream_result(char *err, size_t errsz)
     int res = 0;
     err[0] = '\0';
     pthread_mutex_lock(&g_http_lock);
-    if (g_http && !atomic_load(&g_stop))
-        res = http_stream_result(g_http, err, errsz);
+    if (!atomic_load(&g_stop)) {
+        if (g_http)      res = http_stream_result(g_http, err, errsz);
+        else if (g_hls)  res = hls_stream_result(g_hls, err, errsz);
+    }
     pthread_mutex_unlock(&g_http_lock);
     return res;
 }
@@ -168,6 +183,36 @@ static void on_title(void *user, const char *title)
     pthread_mutex_unlock(&g_lock);
 }
 
+/* ---- hls callbacks (hls worker thread) --------------------------------- */
+
+static void on_hls_ready(void *user, VrCodec codec, long http_status)
+{
+    pthread_mutex_lock(&g_lock);
+    if ((uintptr_t)user != g_gen) {
+        pthread_mutex_unlock(&g_lock);
+        return;
+    }
+    g_st.http_status = http_status;
+    copy_str(g_st.content_type, sizeof(g_st.content_type),
+             codec == VR_CODEC_AAC ? "HLS (AAC)" : "HLS (MPEG audio)");
+    if (g_st.state == PLAYER_CONNECTING)
+        g_st.state = PLAYER_BUFFERING;
+    pthread_mutex_unlock(&g_lock);
+}
+
+/* HLS has no ICY title. The notes worth showing - chosen variant, a skipped
+ * segment, a discontinuity - go in the same field so the panel stays useful. */
+static void on_hls_note(void *user, const char *text)
+{
+    pthread_mutex_lock(&g_lock);
+    if ((uintptr_t)user != g_gen) {
+        pthread_mutex_unlock(&g_lock);
+        return;
+    }
+    copy_str(g_st.title, sizeof(g_st.title), text);
+    pthread_mutex_unlock(&g_lock);
+}
+
 /* ---- decode thread ----------------------------------------------------- */
 
 typedef struct {
@@ -208,13 +253,116 @@ static int feed(const unsigned char *buf, size_t len, PcmCtx *ctx)
     return -1;   /* r == 1: stop requested or audio failure already reported */
 }
 
+/* Replaces the connection's source, keeping the player running.
+ *
+ * A fresh Conn is used rather than reusing the current ring buffer: the old
+ * worker may still be writing into it, and rb_reset would both interleave its
+ * bytes and clear an abort that player_stop had just set. conn_release retires
+ * the old one in the background, so a stuck DNS lookup cannot stall the switch.
+ * Runs on the decode thread, under g_http_lock so it cannot interleave with
+ * player_stop. Returns 0 with *pc repointed, or -1 (error already reported).  */
+static int switch_source(Conn **pc, const char *url, int to_hls)
+{
+    Conn *old = *pc;
+    Conn *nc;
+    char target[sizeof(g_st.url)];
+    unsigned gen;
+    int ok;
+
+    pthread_mutex_lock(&g_lock);
+    if (url)
+        copy_str(g_st.url, sizeof(g_st.url), url);
+    copy_str(target, sizeof(target), g_st.url);
+    g_st.state = PLAYER_CONNECTING;
+    g_st.buffer_pct = 0;
+    /* Everything describing the OLD body has to go. The classifier reads
+     * g_st.content_type back for the new source, and the prebuffer loop can
+     * exit before the new headers arrive (it also exits on stream_finished),
+     * so a leftover "audio/x-scpls" would re-classify the new body as a
+     * playlist and burn a hop on a redirection that is not there. */
+    g_st.content_type[0] = '\0';
+    g_st.http_status = 0;
+    /* A new generation retires the old source's callbacks. It stays alive
+     * until its reaper joins it, and sharing a generation would let its
+     * on_title overwrite the new station's status line mid-swap. */
+    gen = ++g_gen;
+    pthread_mutex_unlock(&g_lock);
+
+    nc = calloc(1, sizeof(*nc));
+    if (!nc || rb_init(&nc->rb, RB_CAPACITY) != 0) {
+        free(nc);
+        set_error("Out of memory");
+        return -1;
+    }
+
+    pthread_mutex_lock(&g_http_lock);
+    if (atomic_load(&g_stop)) {         /* stopped while we were setting up */
+        pthread_mutex_unlock(&g_http_lock);
+        rb_free(&nc->rb);
+        free(nc);
+        return -1;
+    }
+    if (to_hls) {
+        HlsStreamConfig hc;
+        memset(&hc, 0, sizeof(hc));
+        hc.url = target;
+        hc.user_agent = g_ua;
+        hc.ca_file = g_have_ca ? g_ca : NULL;
+        hc.out = &nc->rb;
+        hc.on_ready = on_hls_ready;
+        hc.on_note = on_hls_note;
+        hc.user = (void *)(uintptr_t)gen;
+        nc->hls = hls_stream_start(&hc);
+        ok = nc->hls != NULL;
+    } else {
+        HttpStreamConfig hc;
+        memset(&hc, 0, sizeof(hc));
+        hc.url = target;
+        hc.user_agent = g_ua;
+        hc.ca_file = g_have_ca ? g_ca : NULL;
+        hc.out = &nc->rb;
+        hc.on_headers = on_headers;
+        hc.on_title = on_title;
+        hc.user = (void *)(uintptr_t)gen;
+        nc->http = http_stream_start(&hc);
+        ok = nc->http != NULL;
+    }
+    if (ok) {
+        g_conn = nc;
+        g_rb = &nc->rb;
+        g_http = nc->http;
+        g_hls = nc->hls;
+    }
+    pthread_mutex_unlock(&g_http_lock);
+
+    if (!ok) {
+        rb_free(&nc->rb);
+        free(nc);
+        set_error(to_hls ? "Could not start HLS stream" : "Could not follow playlist");
+        return -1;
+    }
+    conn_release(old);
+    *pc = nc;
+    return 0;
+}
+
 static void *decode_thread(void *arg)
 {
-    (void)arg;
+    Conn *c = arg;
     unsigned long consumed = 0;
     unsigned char *pre = NULL;
     unsigned char *buf = NULL;
+    int hops = 0;
+    size_t n = 0;
 
+    pre = malloc(PREBUFFER_BYTES);
+    buf = malloc(READ_CHUNK);
+    if (!pre || !buf) {
+        set_error("Out of memory");
+        goto out;
+    }
+
+open_source:
     /* 1. pre-buffer */
     while (!atomic_load(&g_stop) && rb_count(g_rb) < PREBUFFER_BYTES && !stream_finished()) {
         update_progress(consumed);
@@ -223,13 +371,7 @@ static void *decode_thread(void *arg)
     if (atomic_load(&g_stop))
         goto out;
 
-    pre = malloc(PREBUFFER_BYTES);
-    buf = malloc(READ_CHUNK);
-    if (!pre || !buf) {
-        set_error("Out of memory");
-        goto out;
-    }
-    size_t n = 0;
+    n = 0;
     while (n < PREBUFFER_BYTES) {
         long r = rb_read(g_rb, pre + n, PREBUFFER_BYTES - n, 0);
         if (r <= 0)
@@ -257,12 +399,36 @@ static void *decode_thread(void *arg)
         kind = sniff_body_kind_from_bytes(pre, n);
     switch (kind) {
     case VR_BODY_HLS:
-        set_error("HLS stations are not supported yet");
-        goto out;
+        if (hops++ >= MAX_SOURCE_HOPS) {
+            set_error("Too many playlist redirections");
+            goto out;
+        }
+        /* The bytes we pre-buffered are the playlist itself; the HLS worker
+         * re-fetches it, so they are simply discarded with the old source. */
+        if (switch_source(&c, NULL, 1) != 0)
+            goto out;
+        consumed = 0;
+        goto open_source;
     case VR_BODY_PLS:
-    case VR_BODY_M3U:
-        set_error("Playlist link (.pls/.m3u) not supported yet");
-        goto out;
+    case VR_BODY_M3U: {
+        if (hops++ >= MAX_SOURCE_HOPS) {
+            set_error("Too many playlist redirections");
+            goto out;
+        }
+        char base[sizeof(g_st.url)];
+        char target[sizeof(g_st.url)];
+        pthread_mutex_lock(&g_lock);
+        copy_str(base, sizeof(base), g_st.url);
+        pthread_mutex_unlock(&g_lock);
+        if (playlist_first_url((const char *)pre, n, base, target, sizeof(target)) != 0) {
+            set_error("Playlist had no usable stream URL");
+            goto out;
+        }
+        if (switch_source(&c, target, 0) != 0)
+            goto out;
+        consumed = 0;
+        goto open_source;
+    }
     case VR_BODY_TEXT:
         set_error("Not an audio stream (%s)", ct);
         goto out;
@@ -348,7 +514,10 @@ int player_init(const char *user_agent, const char *ca_file)
 static void *reap_thread(void *arg)
 {
     Conn *c = arg;
-    http_stream_stop(c->http);   /* may wait out a blocking DNS lookup or connect */
+    if (c->http)
+        http_stream_stop(c->http);   /* may wait out a blocking DNS lookup or connect */
+    if (c->hls)
+        hls_stream_stop(c->hls);
     rb_free(&c->rb);
     free(c);
     atomic_fetch_sub(&g_reapers, 1);
@@ -362,7 +531,7 @@ static void conn_release(Conn *c)
     if (!c)
         return;
     rb_abort(&c->rb);
-    if (c->http) {
+    if (c->http || c->hls) {
         pthread_attr_t attr;
         pthread_t t;
         atomic_fetch_add(&g_reapers, 1);
@@ -374,7 +543,11 @@ static void conn_release(Conn *c)
         if (rc == 0)
             return;
         atomic_fetch_sub(&g_reapers, 1);
-        http_stream_stop(c->http);   /* no thread available: stop inline */
+        /* no thread available: stop inline */
+        if (c->http)
+            http_stream_stop(c->http);
+        if (c->hls)
+            hls_stream_stop(c->hls);
     }
     rb_free(&c->rb);
     free(c);
@@ -429,16 +602,17 @@ void player_play(const char *url)
         return;
     }
     c->http = h;
-    g_conn = c;
     g_rb = &c->rb;
     pthread_mutex_lock(&g_http_lock);
+    g_conn = c;
     g_http = h;
+    g_hls = NULL;
     pthread_mutex_unlock(&g_http_lock);
 
     pthread_attr_t attr;
     pthread_attr_init(&attr);
     pthread_attr_setstacksize(&attr, THREAD_STACK);
-    int rc = pthread_create(&g_thread, &attr, decode_thread, NULL);
+    int rc = pthread_create(&g_thread, &attr, decode_thread, c);
     pthread_attr_destroy(&attr);
     if (rc != 0) {
         player_stop();
@@ -458,14 +632,17 @@ void player_stop(void)
 
     atomic_store(&g_stop, 1);
 
-    /* Detach the handle under g_http_lock so the decode thread can never touch
-     * it after it is freed. */
+    /* Detach the handles and take the connection under g_http_lock: the decode
+     * thread may be swapping the source right now (switch_source), and it holds
+     * the same lock, so we either see the old Conn or the new one - never a
+     * half-swapped pair, and never a Conn it is about to replace. */
     pthread_mutex_lock(&g_http_lock);
     g_http = NULL;
-    pthread_mutex_unlock(&g_http_lock);
-
+    g_hls = NULL;
     Conn *c = g_conn;
     g_conn = NULL;
+    pthread_mutex_unlock(&g_http_lock);
+
     if (c)
         rb_abort(&c->rb);   /* unblocks the decode thread's read and the worker's write */
 

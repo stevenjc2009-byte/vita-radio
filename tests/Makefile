@@ -10,10 +10,25 @@ LDLIBS := -lpthread
 SRC_test_ringbuf := ../src/ringbuf.c
 SRC_test_icy     := ../src/icy.c
 SRC_test_sniff   := ../src/sniff.c
-SRC_test_player  := ../src/player.c ../src/ringbuf.c ../src/sniff.c
+# playlist.c is pure C, so player.c links the real one (as it does ringbuf and
+# sniff); hls.c needs libcurl, so test_player.c stubs it (as it does http_stream).
+SRC_test_player  := ../src/player.c ../src/ringbuf.c ../src/sniff.c ../src/playlist.c ../src/url_util.c
 SRC_test_updater_logic := ../src/version.c ../src/release_json.c
 SRC_test_pkg_meta := ../src/pkg_meta.c ../src/sha1.c
 SRC_test_zip_extract := ../src/zip_extract.c ../src/fs_util.c
+
+# v2.0.0 modules. Every one of these is pure C with no libcurl and no Vita
+# headers, which is why each is unit-testable on the host at all.
+SRC_test_url_util     := ../src/url_util.c
+SRC_test_m3u8         := ../src/m3u8.c ../src/url_util.c
+SRC_test_ts_demux     := ../src/ts_demux.c
+SRC_test_adts_scan    := ../src/adts_scan.c
+SRC_test_aes128       := ../src/aes128.c
+SRC_test_hls_crypt    := ../src/hls_crypt.c ../src/aes128.c
+SRC_test_json         := ../src/json.c
+SRC_test_playlist     := ../src/playlist.c ../src/url_util.c
+SRC_test_station_list := ../src/station_list.c ../src/stations.c
+SRC_test_favourites   := ../src/favourites.c ../src/station_list.c ../src/stations.c
 
 # The host has zlib's runtime but no dev headers: borrow the (portable)
 # zlib.h/zconf.h from the VitaSDK, read-only, and link libz.so.1 by name.

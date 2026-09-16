@@ -5,6 +5,7 @@
  * status; shutdown frees every connection. */
 #include "audio_out.h"
 #include "decoder.h"
+#include "hls.h"
 #include "http_stream.h"
 #include "player.h"
 
@@ -46,6 +47,16 @@ static long now_ms(void)
 static atomic_int fake_block_ms;   /* how long the next connection "resolves" */
 static atomic_int fake_live;       /* stub streams started and not yet freed */
 
+/* Body the next http worker writes before closing, or NULL for none. This is
+ * what lets a test drive the classifier: a playlist body here is what makes
+ * player.c swap its source. */
+static const char *fake_body;
+
+/* Separate from fake_block_ms on purpose: the swap tests need the FIRST source
+ * to answer instantly and the swapped-to source to hang, and one shared knob
+ * cannot express that without racing the swap. */
+static atomic_int fake_hls_block_ms;
+
 struct HttpStream {
     HttpStreamConfig cfg;
     int              block_ms;
@@ -61,6 +72,8 @@ static void *fake_worker(void *arg)
         s->cfg.on_headers(s->cfg.user, "audio/mpeg", 200);
     if (s->cfg.on_title)
         s->cfg.on_title(s->cfg.user, "title from worker");
+    if (fake_body)
+        rb_write(s->cfg.out, (const unsigned char *)fake_body, strlen(fake_body));
     rb_close(s->cfg.out);
     atomic_store(&s->finished, 1);
     return NULL;
@@ -98,6 +111,72 @@ int http_stream_finished(HttpStream *s)
 }
 
 int http_stream_result(HttpStream *s, char *err, size_t errsz)
+{
+    (void)s;
+    if (err && errsz)
+        err[0] = '\0';
+    return 0;
+}
+
+/* ---- hls stub ----------------------------------------------------------- */
+
+/* hls.c pulls in libcurl, so it is stubbed here exactly as http_stream is.
+ * playlist.c is pure C and player.c links the real one. This stub is shaped
+ * like the http one on purpose: an HLS source must be just as abandonable as
+ * an HTTP one, and it shares fake_live so the shutdown leak check covers both. */
+
+struct HlsStream {
+    HlsStreamConfig cfg;
+    int             block_ms;
+    pthread_t       thread;
+    atomic_int      finished;
+};
+
+static void *fake_hls_worker(void *arg)
+{
+    HlsStream *s = arg;
+    usleep((useconds_t)s->block_ms * 1000);   /* like a stuck segment fetch */
+    if (s->cfg.on_ready)
+        s->cfg.on_ready(s->cfg.user, VR_CODEC_AAC, 200);
+    if (s->cfg.on_note)
+        s->cfg.on_note(s->cfg.user, "variant 128k");
+    rb_close(s->cfg.out);
+    atomic_store(&s->finished, 1);
+    return NULL;
+}
+
+HlsStream *hls_stream_start(const HlsStreamConfig *cfg)
+{
+    HlsStream *s = calloc(1, sizeof(*s));
+    if (!s)
+        return NULL;
+    s->cfg = *cfg;
+    s->block_ms = atomic_load(&fake_hls_block_ms);
+    atomic_init(&s->finished, 0);
+    if (pthread_create(&s->thread, NULL, fake_hls_worker, s) != 0) {
+        free(s);
+        return NULL;
+    }
+    atomic_fetch_add(&fake_live, 1);
+    return s;
+}
+
+void hls_stream_stop(HlsStream *s)
+{
+    if (!s)
+        return;
+    rb_abort(s->cfg.out);
+    pthread_join(s->thread, NULL);
+    free(s);
+    atomic_fetch_sub(&fake_live, 1);
+}
+
+int hls_stream_finished(HlsStream *s)
+{
+    return s ? atomic_load(&s->finished) : 1;
+}
+
+int hls_stream_result(HlsStream *s, char *err, size_t errsz)
 {
     (void)s;
     if (err && errsz)
@@ -209,6 +288,57 @@ int main(void)
     check(st.state == PLAYER_ERROR && strcmp(st.error, "audio port open failed") == 0,
           "no audio: state %d error '%s'", st.state, st.error);
     player_shutdown();
+
+    /* ---- source swaps (v2.0.0: HLS and playlist support) ---------------- */
+
+    fake_audio_fail = 0;
+    check(player_init("test", NULL) == 0, "player_init for the swap tests");
+
+    /* 7. an HLS body swaps the source to the HLS worker.
+     * The HLS stub writes no audio, so the run still ends in "Stream ended" -
+     * but it can only reach that state THROUGH the swap, and content_type and
+     * title here can only have been set by the HLS source's own callbacks. */
+    atomic_store(&fake_block_ms, 0);
+    atomic_store(&fake_hls_block_ms, 0);
+    fake_body = "#EXTM3U\n#EXT-X-VERSION:3\n#EXT-X-TARGETDURATION:6\nseg0.ts\n";
+    player_play("http://station/live.m3u8");
+    wait_for_state(PLAYER_ERROR, 3000, &st);
+    check(strcmp(st.content_type, "HLS (AAC)") == 0,
+          "hls swap: content_type '%s' (want 'HLS (AAC)')", st.content_type);
+    check(strcmp(st.title, "variant 128k") == 0,
+          "hls swap: title '%s' (want 'variant 128k')", st.title);
+    player_stop();
+
+    /* 8. a .pls body is parsed by the REAL playlist.c and the URL follows it.
+     * The stub keeps serving the same body, so this also walks into the
+     * MAX_SOURCE_HOPS bound rather than looping forever - which is the point. */
+    fake_body = "[playlist]\nNumberOfEntries=1\nFile1=http://real/stream.mp3\n";
+    player_play("http://station/listen.pls");
+    wait_for_state(PLAYER_ERROR, 3000, &st);
+    check(strcmp(st.url, "http://real/stream.mp3") == 0,
+          "pls swap: url '%s' (want 'http://real/stream.mp3')", st.url);
+    check(strcmp(st.error, "Too many playlist redirections") == 0,
+          "pls hop bound: error '%s' (want 'Too many playlist redirections')", st.error);
+    player_stop();
+
+    /* 9. stopping while the SWAPPED-TO source is stuck must not wait it out.
+     * This is the interleaving the concurrency audit flagged for hardware:
+     * the decode thread has just republished the connection when the UI
+     * thread stops it. */
+    atomic_store(&fake_block_ms, 0);
+    atomic_store(&fake_hls_block_ms, 1500);   /* the HLS source hangs */
+    fake_body = "#EXTM3U\n#EXT-X-TARGETDURATION:6\nseg0.ts\n";
+    player_play("http://station/stuck.m3u8");
+    usleep(400 * 1000);                       /* the swap has happened by now */
+    t0 = now_ms();
+    player_stop();
+    dt = now_ms() - t0;
+    check(dt < 300, "stop during an HLS swap took %ld ms (want < 300)", dt);
+
+    fake_body = NULL;
+    player_shutdown();
+    check(atomic_load(&fake_live) == 0, "%d streams still alive after swap shutdown",
+          atomic_load(&fake_live));
 
     printf("test_player: %d passed, %d failed\n", passed, failed);
     return failed ? 1 : 0;

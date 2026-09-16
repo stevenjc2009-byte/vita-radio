@@ -24,6 +24,7 @@
 #define PANEL_X  (LIST_X + LIST_W + 16)
 #define PANEL_W  (SCREEN_W - PANEL_X - 16)
 #define TOP_Y    56
+#define LIST_Y   (TOP_Y + 24)     /* room for the list label above the rows */
 #define FOOT_Y   (SCREEN_H - 36)
 #define ROW_H    52
 
@@ -84,26 +85,43 @@ void ui_init(void)
     s_font = vita2d_load_default_pgf();
 }
 
-static void draw_list(const BuiltinStation *list, int count, int selected, const PlayerStatus *st)
+static void draw_list(const StationList *list, const char *label, int selected,
+                      const PlayerStatus *st)
 {
-    int visible = (FOOT_Y - TOP_Y - 8) / ROW_H;
+    int count = list ? list->count : 0;
+    int list_h = FOOT_Y - LIST_Y - 8;
+    int visible = list_h / ROW_H;
     int first = 0;
+    if (visible < 1) visible = 1;
     if (selected >= visible) first = selected - visible + 1;
 
-    vita2d_draw_rectangle(LIST_X, TOP_Y, LIST_W, FOOT_Y - TOP_Y - 8, COL_PANEL);
+    char head[160];
+    snprintf(head, sizeof(head), "%s (%d)", label ? label : "Stations", count);
+    text(LIST_X, TOP_Y + 16, COL_ACCENT, 0.9f, LIST_W, head);
+
+    vita2d_draw_rectangle(LIST_X, LIST_Y, LIST_W, list_h, COL_PANEL);
+
+    if (count == 0) {
+        text(LIST_X + 16, LIST_Y + 34, COL_DIM, 0.9f, LIST_W - 32, "No stations in this list.");
+        return;
+    }
 
     for (int i = first; i < count && i < first + visible; i++) {
-        int y = TOP_Y + (i - first) * ROW_H;
-        int active = st && st->state != PLAYER_IDLE && list[i].url &&
-                     strcmp(st->url, list[i].url) == 0;
+        const Station *s = &list->items[i];
+        int y = LIST_Y + (i - first) * ROW_H;
+        int active = st && st->state != PLAYER_IDLE && s->url &&
+                     strcmp(st->url, s->url) == 0;
 
         if (i == selected) vita2d_draw_rectangle(LIST_X, y, LIST_W, ROW_H, COL_SEL);
         if (active) {
             vita2d_draw_rectangle(LIST_X, y, 6, ROW_H, state_color(st->state));
             text(LIST_X + LIST_W - 30, y + 24, state_color(st->state), 1.0f, 24, ">");
         }
-        text(LIST_X + 16, y + 22, COL_TEXT, 1.0f, LIST_W - 56, list[i].name);
-        text(LIST_X + 16, y + 44, COL_DIM, 0.8f, LIST_W - 56, list[i].kind);
+        if (s->is_fav)
+            text(LIST_X + LIST_W - 52, y + 24, COL_ACCENT, 1.0f, 24, "*");
+
+        text(LIST_X + 16, y + 22, COL_TEXT, 1.0f, LIST_W - 76, s->name ? s->name : "");
+        text(LIST_X + 16, y + 44, COL_DIM, 0.8f, LIST_W - 76, s->kind ? s->kind : "");
     }
 }
 
@@ -172,8 +190,8 @@ static unsigned int update_color(UpdateState st)
     }
 }
 
-void ui_draw(const BuiltinStation *list, int count, int selected, const PlayerStatus *st,
-             const UpdateStatus *upd)
+void ui_draw(const StationList *list, const char *list_label, int selected,
+             const PlayerStatus *st, const UpdateStatus *upd, const char *notice)
 {
     vita2d_start_drawing();
     vita2d_clear_screen();
@@ -182,17 +200,22 @@ void ui_draw(const BuiltinStation *list, int count, int selected, const PlayerSt
         vita2d_draw_rectangle(0, 0, SCREEN_W, 44, COL_BAR);
         text(16, 31, COL_ACCENT, 1.3f, 200, "Vita Radio");
         text(160, 31, COL_DIM, 0.8f, 80, "v" VR_VERSION);
-        if (upd && upd->message[0])
+
+        /* A transient notice (searching, search failed) outranks the updater
+         * message in the title bar - it is the thing the user just asked for. */
+        if (notice && notice[0])
+            text(250, 30, COL_ACCENT, 0.85f, SCREEN_W - 266, notice);
+        else if (upd && upd->message[0])
             text(250, 30, update_color(upd->state), 0.85f, SCREEN_W - 266, upd->message);
 
-        draw_list(list, count, selected, st);
+        draw_list(list, list_label, selected, st);
         draw_status(st);
 
         vita2d_draw_rectangle(0, FOOT_Y, SCREEN_W, SCREEN_H - FOOT_Y, COL_BAR);
-        text(16, FOOT_Y + 25, COL_TEXT, 0.9f, SCREEN_W - 32,
+        text(16, FOOT_Y + 25, COL_TEXT, 0.85f, SCREEN_W - 32,
              upd && upd->state == UPD_AVAILABLE
-                 ? "Up/Down select   X play   O stop   TRIANGLE install update   START quit"
-                 : "Up/Down select   X play   O stop   TRIANGLE check for updates   START quit");
+                 ? "X play  O stop  [] search  L/R list  SELECT fav  /\\ install update  START quit"
+                 : "X play  O stop  [] search  L/R list  SELECT fav  /\\ updates  START quit");
     }
 
     vita2d_end_drawing();
